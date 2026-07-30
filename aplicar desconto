@@ -1,0 +1,100 @@
+// ==UserScript==
+// @name         Botão Aplicar Desconto Dinâmico
+// @namespace    http://tampermonkey.net/
+// @version      4.0
+// @description  Adiciona botão para preencher apenas os campos "Código promocional"
+// @author       Você
+// @match        *://*/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const BOTAO_ID = 'btn-aplicar-desconto-custom';
+    const TITULO_MODAL = 'Incluir códigos promocionais';
+    const CODIGO = 'idaevolta10';
+
+    function preencherCodigos() {
+        let total = 0;
+
+        document.querySelectorAll("label").forEach(label => {
+
+            if (!label.textContent.toLowerCase().includes("código promocional")) return;
+
+            // Procura o input dentro do mesmo bloco do label
+            let bloco = label.parentElement;
+
+            while (bloco && !bloco.querySelector("input")) {
+                bloco = bloco.parentElement;
+            }
+
+            if (!bloco) return;
+
+            const input = bloco.querySelector("input");
+
+            if (!input) return;
+
+            try {
+                const setter = Object.getOwnPropertyDescriptor(
+                    HTMLInputElement.prototype,
+                    "value"
+                ).set;
+
+                setter.call(input, CODIGO);
+            } catch {
+                input.value = CODIGO;
+            }
+
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+            input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true }));
+
+            total++;
+        });
+
+        console.log(`Preenchidos ${total} códigos promocionais.`);
+    }
+
+    function criarBotao(container) {
+
+        if (document.getElementById(BOTAO_ID)) return;
+
+        const btn = document.createElement("button");
+        btn.id = BOTAO_ID;
+        btn.textContent = "Aplicar Desconto";
+
+        btn.style.marginTop = "10px";
+        btn.style.padding = "8px 18px";
+        btn.style.background = "#28a745";
+        btn.style.color = "#fff";
+        btn.style.border = "none";
+        btn.style.borderRadius = "5px";
+        btn.style.cursor = "pointer";
+        btn.style.fontWeight = "bold";
+        btn.style.fontSize = "14px";
+
+        btn.addEventListener("click", preencherCodigos);
+
+        container.appendChild(btn);
+    }
+
+    const observer = new MutationObserver(() => {
+
+        const titulo = [...document.querySelectorAll(".h3-lightbox-title")]
+            .find(el => el.textContent.trim().includes(TITULO_MODAL));
+
+        if (titulo) {
+            criarBotao(titulo.parentElement);
+        } else {
+            document.getElementById(BOTAO_ID)?.remove();
+        }
+
+    });
+
+    observer.observe(document.body, {
+        childList: true,
+        subtree: true
+    });
+
+})();
