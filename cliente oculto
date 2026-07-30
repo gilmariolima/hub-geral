@@ -1,0 +1,258 @@
+// ==UserScript==
+// @name         Tallos - Anti Cherry-Picking v41 (Avatar Oculto)
+// @namespace    http://tampermonkey.net/
+// @version      41.0
+// @description  Esconde os nomes, tags e as iniciais do avatar sem depender de coordenadas estritas.
+// @author       William Rodrigues
+// @match        *://*.tallos.com.br/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // 1. ESTILO
+    const style = document.createElement('style');
+    style.innerHTML = `
+        div[role="dialog"], .modal {
+            z-index: 999999 !important;
+        }
+        body.modo-fila-ativa .tooltip,
+        body.modo-fila-ativa .popover,
+        body.modo-fila-ativa [role="tooltip"] {
+            display: none !important;
+            opacity: 0 !important;
+            pointer-events: none !important;
+        }
+    `;
+    document.head.appendChild(style);
+
+    // 2. CRIAÇÃO DOS ESCUDOS DA DIREITA
+    let overlayPrincipal = document.getElementById('escudo-absoluto');
+    let tarjaNome = document.getElementById('tarja-nome-cliente');
+
+    if (!overlayPrincipal) {
+        overlayPrincipal = document.createElement('div');
+        overlayPrincipal.id = 'escudo-absoluto';
+        overlayPrincipal.style.cssText = 'position:fixed; right:0; bottom:0; background:rgba(240, 242, 245, 0.95); backdrop-filter:blur(10px); z-index:999; display:none; flex-direction:column; justify-content:center; align-items:center;';
+
+        overlayPrincipal.innerHTML = `
+            <div style="background:#fff; padding:20px 25px; border-radius:8px; box-shadow:0 4px 15px rgba(0,0,0,0.05); text-align:center; max-width:300px; border:1px solid #e1e4e8;">
+                <div style="background:#e8f0fe; width:45px; height:45px; border-radius:50%; display:flex; justify-content:center; align-items:center; margin:0 auto 15px auto;">
+                    <span style="font-size:20px;">🔒</span>
+                </div>
+                <h2 style="color:#203a7a; margin:0 0 8px 0; font-size:16px; font-weight:bold;">Atendimento Oculto</h2>
+                <p style="font-size:13px; color:#5f6368; line-height:1.4; margin:0;">
+                    Clique em <b>Iniciar</b> para assumir o ticket.
+                </p>
+            </div>
+        `;
+        document.body.appendChild(overlayPrincipal);
+
+        tarjaNome = document.createElement('div');
+        tarjaNome.id = 'tarja-nome-cliente';
+        tarjaNome.style.cssText = 'position:fixed; background:rgba(240, 242, 245, 0.98); backdrop-filter:blur(10px); z-index:999; display:none; align-items:center; padding-left:20px; border-bottom:1px solid #ddd;';
+        tarjaNome.innerHTML = `<span style="font-size:16px; font-weight:bold; color:#555;">👤 Cliente Oculto</span>`;
+        document.body.appendChild(tarjaNome);
+    }
+
+    // 3. FUNÇÃO OLHO BIÔNICO
+    function verificarSeEstaNaFila() {
+        let naFila = false;
+        const elementos = document.querySelectorAll('span, p, div, h1, h2, h3, strong, b');
+
+        for (let el of elementos) {
+            if (el.childElementCount === 0 && el.offsetParent !== null) {
+                const txt = (el.textContent || "").toUpperCase().trim();
+                if (txt.includes('FILA DE ESPERA')) {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.left >= 0 && rect.left < 300 && rect.top >= 0 && rect.top < 150) {
+                        naFila = true;
+                        break;
+                    }
+                }
+            }
+        }
+        return naFila;
+    }
+
+    // 4. MOTOR DE EXECUÇÃO E BLINDAGEM
+    function blindar() {
+        const isNaFila = verificarSeEstaNaFila();
+
+        // --- A. CAÇA OS BOTÕES COM PRECISÃO ---
+        let btnIniciarNormal = null;
+        let isMassaActive = false;
+
+        const elementos = document.querySelectorAll('button, div[role="button"], span');
+
+        for (let el of elementos) {
+            if (el.offsetParent === null) continue;
+
+            const txt = (el.textContent || "").toUpperCase().trim();
+
+            if (txt.includes('INICIAR ATENDIMENTOS')) {
+                isMassaActive = true;
+            }
+            else if (
+                txt === 'INICIAR' || txt === 'ATENDER' || txt === 'ACEITAR' ||
+                (txt.includes('INICIAR') && txt.length < 25 && !txt.includes('ATENDIMENTOS'))
+            ) {
+                const rect = el.getBoundingClientRect();
+                if (rect.left > 300 && rect.top >= 0 && rect.top < 150) {
+                    btnIniciarNormal = el;
+                }
+            }
+        }
+
+        // --- B. CONTROLE DA BARREIRA DO CHAT DIREITO ---
+        if (isMassaActive) {
+            overlayPrincipal.style.display = 'none';
+            tarjaNome.style.display = 'none';
+        }
+        else if (btnIniciarNormal) {
+            let header = btnIniciarNormal.parentElement;
+            let achouCabecalhoSeguro = false;
+
+            while (header && header !== document.body) {
+                const w = header.getBoundingClientRect().width;
+                const h = header.getBoundingClientRect().height;
+
+                if (w > 400 && h > 40 && h < 150) {
+                    achouCabecalhoSeguro = true;
+                    break;
+                }
+                header = header.parentElement;
+            }
+
+            if (achouCabecalhoSeguro) {
+                const rectHeader = header.getBoundingClientRect();
+                overlayPrincipal.style.top = rectHeader.bottom + 'px';
+                overlayPrincipal.style.left = rectHeader.left + 'px';
+
+                tarjaNome.style.top = rectHeader.top + 'px';
+                tarjaNome.style.left = rectHeader.left + 'px';
+                tarjaNome.style.height = rectHeader.height + 'px';
+                tarjaNome.style.width = (rectHeader.width - 300) + 'px';
+            } else {
+                overlayPrincipal.style.top = '135px';
+                overlayPrincipal.style.left = '360px';
+                tarjaNome.style.top = '65px';
+                tarjaNome.style.left = '360px';
+                tarjaNome.style.height = '70px';
+                tarjaNome.style.width = 'calc(100% - 660px)';
+            }
+
+            overlayPrincipal.style.display = 'flex';
+            tarjaNome.style.display = 'flex';
+
+        } else {
+            overlayPrincipal.style.display = 'none';
+            tarjaNome.style.display = 'none';
+        }
+
+        // --- C. CONTROLE DA FILA E REESCRITA (VARREDURA TOTAL) ---
+        if (isNaFila) {
+            document.body.classList.add('modo-fila-ativa');
+
+            const barraBusca = document.querySelector('input[placeholder*="contato"], input[placeholder*="Buscar"]');
+            if (barraBusca) {
+                const limiteTopo = barraBusca.getBoundingClientRect().bottom + 5;
+
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+                let node;
+
+                while ((node = walker.nextNode())) {
+                    const txt = node.nodeValue.trim();
+                    if (txt.length === 0 || txt === 'Cliente Oculto' || txt === '👤') continue;
+
+                    const parent = node.parentElement;
+                    if (!parent) continue;
+
+                    const rect = parent.getBoundingClientRect();
+
+                    // Varre TUDO que estiver dentro da barra esquerda abaixo da busca
+                    if (rect.left >= 0 && rect.left < 360 && rect.top > limiteTopo && rect.bottom > 0) {
+
+                        // --- O NOVO CAÇADOR DE INICIAIS (AVATAR) ---
+                        // Se for um texto de 1 a 2 letras apenas (sem números), independente da coordenada
+                        if (txt.length > 0 && txt.length <= 2 && /^[A-Za-zÀ-ÿ]+$/.test(txt)) {
+                            const txtUpper = txt.toUpperCase();
+                            // Protege apenas as siglas do relógio
+                            if (txtUpper !== 'AM' && txtUpper !== 'PM') {
+                                if (typeof node._originalText === 'undefined') {
+                                    node._originalText = txt;
+                                }
+                                node.nodeValue = '👤';
+                                continue;
+                            }
+                        }
+
+                        // Se tiver menos de 3 letras e não for letra (ex: símbolos, números isolados), ignora
+                        if (txt.length < 3) continue;
+
+                        const txtUpper = txt.toUpperCase();
+
+                        const termosProtegidos = [
+                            'SETOR', 'CANAIS', 'INICIAR', 'ATENDER', 'ATENDIMENTO',
+                            'TRANSFERIR', 'ETIQUETA', 'MARCAR', 'MENSAGEM', 'EXCLUIR',
+                            'RESOLVER', 'CLIENTE OCULTO', 'AGUARDANDO', 'ATENDENTE',
+                            'OCULTA', 'MAIS RECENTE', 'GERÊNCIA', 'FILA',
+                            'BUSCAR', 'CONTATO', 'NOVOS', 'TODOS'
+                        ];
+
+                        const isProtegido = termosProtegidos.some(termo => txtUpper.includes(termo));
+                        const isHora = /^\d{2}:\d{2}/.test(txt) || txtUpper === 'AM' || txtUpper === 'PM';
+                        const isApenasNumeros = /^[\d\s\-\(\)\+]+$/.test(txt);
+
+                        if (!isProtegido && !isHora && !isApenasNumeros) {
+
+                            if (parent.hasAttribute('title')) parent.removeAttribute('title');
+                            if (parent.hasAttribute('data-original-title')) parent.removeAttribute('data-original-title');
+                            if (parent.hasAttribute('data-bs-title')) parent.removeAttribute('data-bs-title');
+                            if (parent.hasAttribute('aria-label')) parent.removeAttribute('aria-label');
+
+                            if (typeof node._originalText === 'undefined') {
+                                node._originalText = txt;
+                            }
+
+                            node.nodeValue = node.nodeValue.replace(txt, 'Cliente Oculto');
+                        }
+                    }
+                }
+            }
+        } else {
+            document.body.classList.remove('modo-fila-ativa');
+
+            // Restaura os textos originais caso você saia da fila
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+            let node;
+            while ((node = walker.nextNode())) {
+                if (node._originalText) {
+                    if (node.nodeValue.includes('Cliente Oculto')) {
+                        node.nodeValue = node.nodeValue.replace('Cliente Oculto', node._originalText);
+                    } else if (node.nodeValue.includes('👤')) {
+                        node.nodeValue = node.nodeValue.replace('👤', node._originalText);
+                    }
+                }
+            }
+        }
+
+        // --- D. TRATAMENTO DO MODAL DE CONFIRMAÇÃO ---
+        const textosModal = document.querySelectorAll('div[role="dialog"] p, div[role="dialog"] span, div[role="dialog"] div');
+        textosModal.forEach(el => {
+            if (el.childElementCount === 0) {
+                const textoOriginal = el.textContent || "";
+                if (textoOriginal.includes('Deseja iniciar o atendimento com') && !textoOriginal.includes('este cliente?')) {
+                    el.textContent = 'Deseja iniciar o atendimento com este cliente?';
+                }
+            }
+        });
+    }
+
+    // 5. VIGILÂNCIA CONTÍNUA
+    const observador = new MutationObserver(() => { blindar(); });
+    observador.observe(document.body, { childList: true, subtree: true });
+    setInterval(blindar, 300);
+
+})();
