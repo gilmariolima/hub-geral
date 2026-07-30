@@ -1,0 +1,372 @@
+// ==UserScript==
+// @name         SMARTBUS + TALLOS
+// @namespace    http://tampermonkey.net/
+// @version      3.0.0
+// @description  Une SMARTBUS Copiar com Clique + Tallos Botões de Mensagens (sem alterar textos)
+// @author       GILMARIO
+// @match        https://prod-guanabara-frontoffice-smartbus.smarttravelit.com/*
+// @match        https://app.tallos.com.br/app/chat*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const url = location.href;
+
+  /* =====================================================================================
+     ============================== SMARTBUS – COPIAR =====================================
+     ===================================================================================== */
+
+  if (url.includes('smartbus.smarttravelit.com')) {
+
+    function isReserva() {
+      return document.querySelector('.page-title')?.textContent?.trim() === 'Reserva';
+    }
+
+    function normalizarDocumento(texto) {
+      if (texto.includes('-')) {
+        return texto.split('-').slice(1).join('-').trim();
+      }
+      return texto.trim();
+    }
+
+    function aplicarCliqueCopiar(el, tipo = 'normal') {
+      if (!el || el.dataset.copiarAtivo) return;
+
+      let texto = el.textContent?.trim();
+      if (!texto) return;
+
+      if (tipo === 'documento') {
+        texto = normalizarDocumento(texto);
+      }
+
+      el.dataset.copiarAtivo = 'true';
+
+      el.style.border = '1px dashed darkred';
+      el.style.padding = '4px 10px';
+      el.style.borderRadius = '6px';
+      el.style.cursor = 'pointer';
+      el.style.transition = 'border-color 0.2s ease, background-color 0.2s ease';
+      el.title = 'Clique para copiar';
+
+      el.addEventListener('click', (e) => {
+        e.stopPropagation();
+        navigator.clipboard.writeText(texto);
+
+        el.style.borderColor = 'green';
+        el.style.backgroundColor = '#e6f4ea';
+
+        setTimeout(() => {
+          el.style.borderColor = 'darkred';
+          el.style.backgroundColor = 'transparent';
+        }, 1200);
+      });
+    }
+
+    function aplicar() {
+      if (!isReserva()) return;
+
+      // 🔹 CIDADES
+      document
+        .querySelectorAll('.col-coupon-service-title b')
+        .forEach(el => aplicarCliqueCopiar(el));
+
+      // 🔹 DATAS
+      document
+        .querySelectorAll('.col-coupon-service b')
+        .forEach(b => {
+          if (/\d{2}\/\d{2}\/\d{4}/.test(b.textContent)) {
+            aplicarCliqueCopiar(b);
+          }
+        });
+
+      // 🔹 PASSAGEIROS
+      const tituloPassageiros = [...document.querySelectorAll('h3, h4')]
+        .find(h => h.textContent.trim() === 'Passageiros');
+
+      if (tituloPassageiros) {
+        const blocoPassageiros = tituloPassageiros.closest('.card, .card-body, .card-coupon-area');
+
+        blocoPassageiros?.querySelectorAll('tbody tr').forEach(tr => {
+          const tds = tr.querySelectorAll('td');
+          aplicarCliqueCopiar(tds[1]);               // Passageiro
+          aplicarCliqueCopiar(tds[2], 'documento'); // Documento
+          aplicarCliqueCopiar(tds[4]);               // Telefone
+        });
+      }
+
+      // 🔹 EMAIL
+      document
+        .querySelectorAll('.card-coupon-actions')
+        .forEach(card => {
+          [...card.querySelectorAll('*')].forEach(el => {
+            if (el.textContent?.trim() === 'E-mail') {
+              const valorEmail = el.nextElementSibling;
+              if (valorEmail) aplicarCliqueCopiar(valorEmail);
+            }
+          });
+        });
+    }
+
+    const observerSmart = new MutationObserver(aplicar);
+    observerSmart.observe(document.body, { childList: true, subtree: true });
+    aplicar();
+  }
+
+  /* =====================================================================================
+     ================================ TALLOS – BOTÕES =====================================
+     ===================================================================================== */
+
+  if (url.includes('app.tallos.com.br')) {
+      function esconderSugestaoResposta() {
+          document
+              .querySelectorAll('button.suggestion-button.tg-btn_tertiary[title="Ver sugestão de resposta"]')
+              .forEach(btn => {
+              btn.style.display = 'none';
+          });
+      }
+
+    const MENSAGENS = [
+    { icon: '🤖', title: 'SAUDACAO DIRETA', texto: `Prezado(a) cliente, esse atendimento gerou um protocolo de número: @PROTOCOLO
+
+@SALDACAO @CLIENTE, tudo bem? Me chamo @ATENDENTE, seu agente de viagens. Como posso ajudar?` },
+
+// =======================================================================================================================================
+
+ { icon: '👍', title: 'SIM CLIENTE', texto: `Prezado(a) cliente, esse atendimento gerou um protocolo de número: @PROTOCOLO
+@SALDACAO @CLIENTE, tudo bem? Me chamo @ATENDENTE, seu agente de viagens.
+
+Identificamos que sua tentativa de compra anterior deu erro e foi cancelada. Irei gerar sua nova reserva e acompanhar todo o processo para garantir que seja finalizada com sucesso, conforme sua solicitação.
+` },
+
+
+// =======================================================================================================================================
+    { icon: '🚌', title: 'REMARCACAO', texto: `🚌 Remarcação de Passagem
+
+*Para remarcar, preciso que você envie:*
+📄 Bilhete em PDF ou foto.
+🪪 Foto do RG ou CNH (frente e verso) do titular da passagem.
+🕒 Nova data e horário desejados.
+
+⚠️ Se faltar menos de 3h pro embarque, há multa de 20%. Passagens que já ultrapassaram esse prazo de 3h, a remarcação só pode ser feita para o *MESMO TRECHO*.
+
+🔁 Remarcações anteriores com multa *terão nova cobrança*.
+💵 Se o novo horário for mais caro, *será cobrada a diferença*.
+📍 Em passagens intermunicipais do estado de RJ, alterações só até 1h antes do embarque. Depois disso, o bilhete perde validade.
+Trechos intermunicipais do estado de MG é necessário solicitar até 12h antes.
+Viagens intermunicipais dentro do estado de São Paulo só podem ser remarcadas ou canceladas se solicitado até no máximo 8h antes do horário de partida segundo o Artigo 93 do DECRETO Nº 29.913.
+
+💳 Pagamentos apenas via *PIX CNPJ*.
+💻 Na nossa plataforma, há também uma taxa de serviço para remarcações.
+
+*Qualquer dúvida, estou à disposição!*` },
+
+    { icon: '✈', title: 'TRECHO', texto: `Por gentileza, poderia informar as seguintes informações sobre a sua viagem:
+
+Origem: cidade de partida
+Destino: cidade de chegada
+Data: data da partida da viagem
+
+*Informe se a viagem tem volta*` },
+    { icon: '⛔', title: 'POLTRONA OCUPADA', texto: `A poltrona do(a) senhor(a) vai ficar bloqueada por até 10 minutos devido a tentativa cancelada anteriormente, poderia ser outra poltrona?
+
+*CINZAS LIVRES*` },
+
+    { icon: '💺', title: 'POLTRONAS', texto: `💺 Mapa de Poltronas
+
+🟩 Verde: poltronas sugeridas / opções de escolha
+⬜ Cinza: poltronas disponíveis
+🟥 Vermelho: poltronas vendidas / ocupadas
+🟧 Laranja: poltronas pendentes / em processo de venda
+
+Por gentileza, escolha a(s) poltrona(s) desejada(s) para dar continuidade ao atendimento.` },
+
+    { icon: '🪪', title: 'DADOS', texto: `Dados do Passageiro -
+Nome:
+RG:
+CPF:
+Data de Nascimento:` },
+
+{ icon: '⚠️', title: 'CONFERE', texto: `*Por gentileza, poderia conferir se todas as informações da sua reserva estão corretas? (Passageiro, Trecho, Data, horário e poltrona*)` },
+
+{ icon: '⚠️', title: 'REFORCA DADOS', texto: `Senhor(a), reforçamos que é essencial a conferência de todos os dados do bilhete, a fim de evitar qualquer tipo de transtorno futuro.
+
+A verificação de todas as informações do bilhete é de responsabilidade do passageiro.` },
+
+{ icon: '🔗', title: 'LINK', texto: `Segue link para pagamento via Cartão de crédito e PIX:
+
+PAGAMENTO CARTÃO.
+1: Utilizar o virtual para finalizar a compra online.
+2: Em COMPRADOR colocar os dados COMPLETOS do titular do cartão virtual.
+3: Em PAGAMENTO colocar os dados CONFORME consta no cartão virtual.
+4: Limpar os dados do navegador ou trocar de navegador, antes de tentar novamente.
+5: Trocar o E-mail, pois alguns e-mails o nosso sistema não reconhece e acaba cancelando a reserva.
+6: No CEP da fatura, preencher com o CEP do local onde foi solicitado o cartão.
+
+LINK DE PAGAMENTO VÁLIDO POR APENAS 30 MINUTOS.` },
+
+{ icon: '❖', title: 'PIX', texto: `Segue abaixo os dados bancários para transferência via PIX!
+
+Valor: R$
+
+Nome: VALE VIAGENS/ ANTÔNIO CLERVES
+CHAVE CNPJ: 18.826.066/0001-09
+
+Emissão da passagem mediante ao envio do comprovante de pagamento!` },
+
+{ icon: '🏁', title: 'COMPRA FIM', texto: `Sua compra foi realizada com sucesso! 🎉
+
+Suas passagens serão enviadas por este chat em instantes. Além disso, uma cópia também será encaminhada para o e-mail informado no momento da compra.
+
+Posso ajudar em mais alguma coisa?` },
+
+{ icon: '🔎', title: 'VERIFICA', texto: `Confira se os dados do seu bilhete estão corretos
+Verifique trecho, data, horário e dados pessoais no bilhete anexo ou enviado por e-mail.
+
+Se houver algum erro, avise em até 30 minutos.
+
+Alterações devem ser solicitadas com até 3 horas antes do embarque, dentro do nosso horário de atendimento. Após esse prazo, será cobrada multa de 20% do valor da passagem.` },
+
+{ icon: '🤔', title: 'AGRADECE', texto: `Agradeço o contato, confiança e preferência em nosso trabalho. Ficamos à disposição para lhe atender posteriormente.
+
+@SALDACAO e uma excelente viagem.` },
+{ icon: '🤔', title: 'DUVIDA', texto: `📍 Informações importantes para o embarque
+
+📄 Documentos aceitos (originais):
+• CIN/RG (físico ou digital pelo app Gov.br)
+• CNH (física ou digital pelo app Carteira Digital de Trânsito)
+• Carteira de Trabalho (física)
+• Passaporte ou RIC
+• e-Título (no aplicativo, com foto visível)
+👶 Viagem de menores
+• Até 6 anos incompletos: podem viajar gratuitamente no colo de um responsável pagante, conforme disponibilidade.
+• Até 12 anos: apresentar certidão de nascimento, RG ou passaporte (originais). Também aceitamos RG digital pelo Gov.br e cópia autenticada em cartório.
+• A partir de 12 anos: apresentar RG ou passaporte (original). Também aceitamos RG digital pelo Gov.br e cópia autenticada em cartório.
+👩‍👧 Menores de 16 anos acompanhados
+
+Podem viajar com pais, avós, irmãos maiores de 18 anos, tios, sobrinhos maiores de 18 anos, tutores ou guardiões legais, desde que seja possível comprovar o parentesco por meio de documentos originais.
+
+👥 Acompanhante sem parentesco
+É necessário que seja maior de 18 anos e apresente autorização dos pais ou responsáveis, com firma reconhecida em cartório. Modelos disponíveis em: https://autoriza.net.
+
+👦 Menor de 16 anos desacompanhado
+Só pode viajar com documento de identidade e autorização dos pais ou responsáveis, com firma reconhecida em cartório. Modelos disponíveis em: https://autoriza.net.
+
+✅ Adolescentes de 16 a 18 anos
+Podem viajar sozinhos, sem autorização, desde que apresentem documento de identidade original e válido.
+
+⚠️ Os horários podem sofrer alterações, pois os ônibus estão sujeitos às condições da viagem e do trânsito.
+Estamos à disposição 24h. Qualquer dúvida, é só chamar! 😊` },
+
+
+{ icon: '🖨️', title: 'REENVIO', texto: `Para reenvio de PDF preciso que me encaminhe a foto da documentação frente e verso do titular do bilhete, para que fique registrado em sistema que o mesmo está ciente da solicitação.
+
+E informar o e-mail de reenvio.` },
+
+{ icon: '🛂', title: 'EMBARQUE', texto: `Basta mostrar o PDF do bilhete ao motorista pela tela do celular no momento do embarque junto com o documento original físico com foto ( PREFERÊNCIA RG) que consegue embarcar normalmente, mas caso deseje imprimir os bilhetes, basta chegar 30min antes do horário de embarque, se dirigir até o guichê e com o localizador, imprimir o bilhete.` },
+
+{ icon: '🛎️', title: 'RESERVA', texto: `Estarei gerando a reserva do(a) senhor(a) para darmos continuidade por aqui, tudo bem?` },
+
+{ icon: '🔁', title: 'CONTINUIDADE', texto: `@CLIENTE, caso deseje dar continuidade, será criada uma reserva conforme sua solicitação anterior, porém, forneceremos algumas orientações que estarão lhe ajudando na conclusão de sua compra.
+
+Gostaria de dar continuidade a sua reserva agora mesmo?` },
+
+{ icon: '📢', title: 'FALTA DE COMUNICACAO', texto: `Atendimento interrompido por falta de comunicação. Se desejar, estamos disponíveis para continuar a atendê-lo(a).
+
+Lembrando que nosso atendimento é 24 horas e 100% humanizado, além de fornecemos suporte durante toda sua viagem!` },
+
+{ icon: '☎️', title: 'SAC', texto: `SAC: 0800 728 1992 - Opção 1, em seguida opção 9 e opção 1 novamente`},
+
+{ icon: '🙌', title: 'CONSEGUIU FINALIZAR', texto: `Que bom que deu tudo certo!, Tenha uma ótima viagem! Lembre-se que estamos disponíveis pelo WhatsApp para te ajudar no que precisar.
+
+Comprando conosco por aqui, além dos melhores valores de tarifação e atendimento 100% humanizado, você terá suporte durante toda a sua viagem!, lembrando que esse é um portal de vendas 24 horas
+
+Salve já nosso contato para as suas próximas adesões.` },
+
+{ icon: '📁', title: 'DOCUMENTO', texto: `Me envia o bilhete e documento do titular por favor`},
+{ icon: '❌ ', title: 'ERRO', texto: `Provavelmente houve algum erro durante o preenchimento dos dados ou uma instabilidade no sistema, o que fez com que o pagamento não fosse reconhecido corretamente.
+Para darmos continuidade, estarei gerando uma nova reserva para o(a) senhor(a). Tudo bem?`},
+];
+    const TOOLBAR_SELECTOR = '.ql-toolbar.ql-snow';
+    const EDITOR_SELECTOR = '.ql-editor';
+    const GRUPO_ID = 'tallos-botoes-mensagens';
+
+    const style = document.createElement('style');
+    style.innerHTML = `
+      #${GRUPO_ID} button { position: relative; }
+      #${GRUPO_ID} button::after {
+        content: attr(data-tooltip);
+        position: absolute;
+        top: -34px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: #000;
+        color: #fff;
+        padding: 4px 8px;
+        border-radius: 6px;
+        font-size: 11px;
+        white-space: nowrap;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity .15s ease;
+        z-index: 9999;
+      }
+      #${GRUPO_ID} button:hover::after { opacity: 1; }
+    `;
+    document.head.appendChild(style);
+
+      const observerTallos = new MutationObserver(() => {
+          esconderSugestaoResposta();
+          inserirBotoes();
+      });
+
+    observerTallos.observe(document.body, { childList: true, subtree: true });
+    inserirBotoes();
+
+    function inserirBotoes() {
+      const toolbar = document.querySelector(TOOLBAR_SELECTOR);
+      if (!toolbar || document.getElementById(GRUPO_ID)) return;
+
+      const grupo = document.createElement('div');
+      grupo.id = GRUPO_ID;
+      grupo.style.cssText = `display:flex;gap:3px;margin-right:15px;`;
+
+      MENSAGENS.forEach(msg => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.innerHTML = msg.icon;
+        btn.setAttribute('data-tooltip', msg.title);
+        btn.style.cssText = `
+          width:28px;height:28px;background:transparent;border:none;
+          border-radius:6px;font-size:16px;cursor:pointer;opacity:.75;
+          display:flex;align-items:center;justify-content:center;
+        `;
+        btn.onmouseenter = () => btn.style.opacity = '1';
+        btn.onmouseleave = () => btn.style.opacity = '.75';
+        btn.onclick = () => inserirTexto(msg.texto, btn);
+        grupo.appendChild(btn);
+      });
+
+      toolbar.insertBefore(grupo, toolbar.firstChild);
+    }
+
+    function inserirTexto(texto, btn) {
+      const editor = document.querySelector(EDITOR_SELECTOR);
+      if (!editor) return;
+
+      editor.innerHTML = texto
+        .replace(/\r/g, '')
+        .split('\n')
+        .map(l => l.trim() === '' ? '<p><br></p>' : `<p>${l}</p>`)
+        .join('');
+
+      editor.dispatchEvent(new Event('input', { bubbles: true }));
+
+      const original = btn.innerHTML;
+      btn.innerHTML = '✅';
+      setTimeout(() => btn.innerHTML = original, 800);
+    }
+  }
+
+})();
