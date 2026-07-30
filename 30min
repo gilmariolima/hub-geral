@@ -1,0 +1,380 @@
+// ==UserScript==
+// @name         30 min
+// @namespace    http://tampermonkey.net/
+// @version
+// @description
+// @author       William Rodrigues
+// @match        *://*.tallos.com.br/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // ==========================================
+    // ⚙️ CONFIGURAÇÕES (EDITÁVEL PELO USUÁRIO)
+    // ==========================================
+    const CONFIG = {
+        TEMPO_LIMITE_MINUTOS: 30, // Tempo em minutos para o alerta
+
+        // Se quiser usar imagens próprias, cole o link abaixo (ex: "https://site.com/foto.png").
+        // Deixado em branco: o script usa apenas a cor da bolinha (verde = ok, vermelho = atraso).
+        URL_IMAGEM_NORMAL: "",
+        URL_IMAGEM_ALERTA: ""
+    };
+
+    const TEMPO_LIMITE_MS = CONFIG.TEMPO_LIMITE_MINUTOS * 60 * 1000;
+    let quantidadeAtrasadosAnterior = 0;
+
+    // ==========================================
+    // 1. ESTILOS DO WIDGET
+    // ==========================================
+    const style = document.createElement('style');
+    style.innerHTML = `
+        #tallos-widget-wrapper {
+            position: fixed;
+            right: 464px;
+            top: 8px;
+            z-index: 999999;
+            font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        }
+
+        /* BOLINHA (mesmo tamanho do widget de alarme: 52px) */
+        .tallos-bubble {
+            width: 45px;
+            height: 45px;
+            background: linear-gradient(150deg, #2ee69a, #10b981);
+            border-radius: 50%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: #14211b;
+            cursor: pointer;
+            user-select: none;
+            position: relative;
+        }
+        .tallos-bubble:hover {
+            transform: translateY(-2px) scale(1.05);
+        }
+        .tallos-bubble:active { transform: scale(0.95); }
+
+        .tallos-bubble.has-alerts {
+            background: linear-gradient(150deg, #ff6b6b, #ef4444);
+            color: #241414;
+            animation: tallosPulseBubble 2s infinite;
+        }
+        .tallos-bubble.has-alerts:hover {
+        }
+
+        @keyframes tallosPulseBubble {
+            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5); }
+            70% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+        }
+
+        /* IMAGENS CUSTOMIZADAS */
+        .tallos-custom-img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            border-radius: 50%;
+            pointer-events: none;
+        }
+
+        /* CONTADOR */
+        .tallos-badge {
+            position: absolute;
+            top: -2px;
+            right: -2px;
+            background: #232025;
+            color: #ff6a1f;
+            font-size: 12px;
+            font-weight: 800;
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            border: 1.5px solid rgba(255, 106, 31, 0.4);
+            opacity: 0;
+            transform: scale(0);
+            transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            z-index: 2;
+        }
+        .tallos-bubble.has-alerts .tallos-badge {
+            opacity: 1;
+            transform: scale(1);
+        }
+
+        /* MENU POP-UP (tema dark) */
+        .tallos-popup-menu {
+            position: absolute;
+            top: 60px;
+            right: 0;
+            width: 240px;
+            background: #1c1a1e;
+            border-radius: 16px;
+            border: 1px solid rgba(255, 106, 31, 0.3);
+            overflow: hidden;
+
+            opacity: 0;
+            visibility: hidden;
+            transform: translateY(-15px) scale(0.95);
+            transform-origin: top right;
+            transition: all 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        }
+        .tallos-popup-menu.show {
+            opacity: 1;
+            visibility: visible;
+            transform: translateY(0) scale(1);
+        }
+
+        .tallos-popup-header {
+            background: #232025;
+            border-bottom: 1px solid rgba(255, 106, 31, 0.25);
+            padding: 10px 14px;
+            color: #a89d94;
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .tallos-client-list {
+            list-style: none;
+            margin: 0;
+            padding: 6px;
+            max-height: 220px;
+            overflow-y: auto;
+        }
+        .tallos-client-list::-webkit-scrollbar { width: 4px; }
+        .tallos-client-list::-webkit-scrollbar-thumb { background: #3a3640; border-radius: 10px; }
+
+        .tallos-client-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 10px;
+            border-radius: 8px;
+            margin-bottom: 2px;
+            transition: all 0.2s ease;
+            cursor: pointer;
+            border: 1px solid transparent;
+        }
+        .tallos-client-item:hover {
+            background: rgba(255, 106, 31, 0.12);
+            border-color: rgba(255, 106, 31, 0.3);
+        }
+
+        .tallos-client-name {
+            font-size: 12px;
+            color: #f3ece6;
+            font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 140px;
+        }
+
+        .tallos-client-time { font-size: 10px; color: #ff6a1f; font-weight: 700; }
+
+        .icon-ok { display: block; }
+        .icon-alert { display: none; }
+        .tallos-bubble.has-alerts .icon-ok { display: none; }
+        .tallos-bubble.has-alerts .icon-alert { display: block; }
+    `;
+    document.head.appendChild(style);
+
+    // ==========================================
+    // 2. CONSTRUÇÃO DOS ÍCONES/IMAGENS
+    // ==========================================
+    const iconeNormalHTML = CONFIG.URL_IMAGEM_NORMAL !== ""
+        ? `<img src="${CONFIG.URL_IMAGEM_NORMAL}" class="icon-ok tallos-custom-img">`
+        : `<svg class="icon-ok" width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`;
+
+    const iconeAlertaHTML = CONFIG.URL_IMAGEM_ALERTA !== ""
+        ? `<img src="${CONFIG.URL_IMAGEM_ALERTA}" class="icon-alert tallos-custom-img">`
+        : `<svg class="icon-alert" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6l12 12M18 6L6 18"/></svg>`;
+
+    // 3. ESTRUTURA HTML DA BOLINHA
+    const wrapperUI = document.createElement('div');
+    wrapperUI.id = 'tallos-widget-wrapper';
+    wrapperUI.innerHTML = `
+        <div class="tallos-popup-menu" id="tallos-popup">
+            <div class="tallos-popup-header">
+                Atrasos na Fila
+                <span style="color: #ef4444; font-size: 14px;">⚠️</span>
+            </div>
+            <ul class="tallos-client-list" id="tallos-lista-clientes"></ul>
+        </div>
+
+        <div class="tallos-bubble" id="tallos-bubble">
+            ${iconeNormalHTML}
+            ${iconeAlertaHTML}
+            <div class="tallos-badge" id="tallos-badge">0</div>
+        </div>
+    `;
+    document.body.appendChild(wrapperUI);
+
+    const bubbleUI = document.getElementById('tallos-bubble');
+    const popupUI = document.getElementById('tallos-popup');
+    const listaUI = document.getElementById('tallos-lista-clientes');
+    const badgeUI = document.getElementById('tallos-badge');
+
+    // ==========================================
+    // 4. (som removido)
+    // ==========================================
+
+    // ==========================================
+    // 5. LÓGICA DE CLIQUE (SEM ARRASTAR)
+    // ==========================================
+    bubbleUI.addEventListener('click', function(e) {
+        if (bubbleUI.classList.contains('has-alerts')) {
+            popupUI.classList.toggle('show');
+        }
+    });
+
+    document.addEventListener('click', function(e) {
+        if (!wrapperUI.contains(e.target)) {
+            popupUI.classList.remove('show');
+        }
+    });
+
+    // ==========================================
+    // 6. MOTOR DE VARREDURA (ANTI-MENU E ESPACIAL)
+    // ==========================================
+    function varrerFilaLateral() {
+        const todosElementos = document.querySelectorAll('*');
+        const horariosEncontrados = [];
+        const clientesAtrasados = [];
+        const agora = Date.now();
+
+        for (let el of todosElementos) {
+            if (el.children.length === 0 && el.offsetParent) {
+                const rect = el.getBoundingClientRect();
+
+                if (rect.left >= 230 && rect.left < 400 && rect.top > 80 && rect.width > 0) {
+                    const txt = el.textContent.trim();
+                    if (txt.length > 10) continue;
+                    const match = txt.match(/^([0-2]?[0-9]):([0-5][0-9])\s*(AM|PM)?$/i);
+
+                    if (match) {
+                        horariosEncontrados.push({ el, txt, match, rect });
+                    }
+                }
+            }
+        }
+
+        horariosEncontrados.forEach(item => {
+            let hora = parseInt(item.match[1], 10);
+            const min = parseInt(item.match[2], 10);
+            const ampm = item.match[3] ? item.match[3].toUpperCase() : null;
+
+            if (ampm) {
+                if (ampm === 'PM' && hora < 12) hora += 12;
+                if (ampm === 'AM' && hora === 12) hora = 0;
+            }
+
+            const dataReal = new Date();
+            dataReal.setHours(hora, min, 0, 0);
+
+            if (dataReal.getTime() > agora) {
+                dataReal.setDate(dataReal.getDate() - 1);
+            }
+
+            const tempoDecorrido = agora - dataReal.getTime();
+
+            if (tempoDecorrido >= TEMPO_LIMITE_MS) {
+                let nomeDoCliente = "Cliente Oculto";
+                let elementoFisicoOriginal = null;
+                let menorDistanciaX = 999;
+
+                for (let elNome of todosElementos) {
+                    if (elNome === item.el || elNome.children.length > 0 || !elNome.offsetParent) continue;
+                    const rectNome = elNome.getBoundingClientRect();
+
+                    if (rectNome.left > 75 && rectNome.left < 260 && Math.abs(rectNome.top - item.rect.top) < 25) {
+                        const txtNome = elNome.textContent.trim();
+                        const txtNomeUpper = txtNome.toUpperCase();
+
+                        const ignorar = [
+                            'DASHBOARD', 'CONTATOS', 'RELATÓRIOS', 'CONFIGURAÇÕES', 'MENSAGENS',
+                            'SETOR', 'SETORES', 'CANAIS', 'MEUS ATENDIMENTOS', 'MAIS RECENTE',
+                            'BUSCAR', 'TRANSFERIR', 'ENCERRAR', 'PERFIL', 'ETIQUETAS', 'ATIVIDADES',
+                            'FUNIL', 'FUNIS', 'CARTEIRAS', 'HISTÓRICO', 'BUSCAR POR CONTATO',
+                            'INÍCIO', 'CHAT', 'AUTOMAÇÃO', 'ANALISAR', 'INVISÍVEL',
+                            'OPERADORES', 'FILA DE ESPERA', 'CHATBOT', 'TODOS', 'NÃO LIDAS'
+                        ];
+
+                        const isTermoProibido = ignorar.some(termo => txtNomeUpper === termo || txtNomeUpper.includes(termo));
+
+                        if (txtNome.length > 2 && !txtNome.match(/\d{2}:\d{2}/) && !isTermoProibido) {
+                            if (rectNome.left < menorDistanciaX) {
+                                menorDistanciaX = rectNome.left;
+                                nomeDoCliente = txtNome;
+                                elementoFisicoOriginal = elNome;
+                            }
+                        }
+                    }
+                }
+
+                const tempoAbsoluto = Math.abs(tempoDecorrido);
+                const horas = Math.floor(tempoAbsoluto / 3600000);
+                const minutos = Math.floor((tempoAbsoluto % 3600000) / 60000);
+                let tempoTexto = horas > 0 ? `${horas}h ${minutos}m` : `${minutos} min`;
+
+                if (nomeDoCliente !== "Cliente Oculto") {
+                    clientesAtrasados.push({
+                        nome: nomeDoCliente,
+                        atraso: tempoTexto,
+                        elementoAlvo: elementoFisicoOriginal
+                    });
+                }
+            }
+        });
+
+        listaUI.innerHTML = '';
+
+        if (clientesAtrasados.length > 0) {
+            const clientesUnicos = [...new Map(clientesAtrasados.map(c => [c.nome, c])).values()];
+            const quantidadeAtual = clientesUnicos.length;
+
+            quantidadeAtrasadosAnterior = quantidadeAtual;
+
+            clientesUnicos.forEach(cliente => {
+                const li = document.createElement('li');
+                li.className = 'tallos-client-item';
+                li.innerHTML = `
+                    <span class="tallos-client-name" title="${cliente.nome}">${cliente.nome}</span>
+                    <span class="tallos-client-time">${cliente.atraso}</span>
+                `;
+
+                li.addEventListener('click', () => {
+                    if (cliente.elementoAlvo) {
+                        cliente.elementoAlvo.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        cliente.elementoAlvo.click();
+                        popupUI.classList.remove('show');
+                    }
+                });
+
+                listaUI.appendChild(li);
+            });
+
+            bubbleUI.classList.add('has-alerts');
+            badgeUI.innerText = quantidadeAtual;
+
+        } else {
+            bubbleUI.classList.remove('has-alerts');
+            popupUI.classList.remove('show');
+            quantidadeAtrasadosAnterior = 0;
+        }
+    }
+
+    setTimeout(varrerFilaLateral, 1000);
+    setInterval(varrerFilaLateral, 5000);
+
+})();
