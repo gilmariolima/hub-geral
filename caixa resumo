@@ -1,0 +1,602 @@
+// ==UserScript==
+// @name         Somar Venda Líquida por Funcionário
+// @namespace    http://tampermonkey.net/
+// @version      1.0.1
+// @description  Soma venda líquida por funcionário, separa por turno manhã/noite e mostra diferença
+// @author       Gilvan
+// @match        *://*/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const noite = [
+        "Gilmario lima",
+        "Nicole Silveira",
+        "Guilherme Moura",
+        "Marcelo Santos",
+        "Aline Simplicio",
+        "Marcus Luan",
+        "Cayo Mendes",
+        "Felipe Honorato",
+        "Aline Silva"
+    ];
+
+    const manha = [
+        "Pedro Santos",
+        "Lucas Sombra",
+        "Bruno Amancio",
+        "Andre Lucas",
+        "Daniel Lima",
+        "Kaio Leão",
+        "Uelisson Torres",
+        "Joao Pedro",
+        "Manoel William"
+    ];
+
+    const ID_PAINEL = "painel-venda-liquida-funcionarios";
+
+    function normalizarTexto(txt) {
+        return String(txt || "")
+            .normalize("NFD")
+            .replace(/[\u0300-\u036f]/g, "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .toLowerCase();
+    }
+
+    function formatarMoeda(valor) {
+        return valor.toLocaleString("pt-BR", {
+            style: "currency",
+            currency: "BRL"
+        });
+    }
+
+    function parseMoedaBR(texto) {
+        if (!texto) return 0;
+
+        let limpo = String(texto)
+            .replace(/BRL/gi, "")
+            .replace(/R\$/gi, "")
+            .replace(/\s+/g, "")
+            .trim();
+
+        const negativo = limpo.includes("-");
+
+        limpo = limpo
+            .replace(/-/g, "")
+            .replace(/\./g, "")
+            .replace(",", ".");
+
+        const numero = parseFloat(limpo);
+
+        if (isNaN(numero)) return 0;
+
+        return negativo ? -numero : numero;
+    }
+
+    function encontrarTabela() {
+        const tabelas = [...document.querySelectorAll("table")];
+
+        for (const tabela of tabelas) {
+            const texto = normalizarTexto(tabela.innerText);
+
+            if (
+                texto.includes("usuario") &&
+                texto.includes("venda liquida")
+            ) {
+                return tabela;
+            }
+        }
+
+        return null;
+    }
+
+    function encontrarIndiceColuna(tabela, nomesPossiveis) {
+        const ths = [...tabela.querySelectorAll("thead th")];
+
+        for (let i = 0; i < ths.length; i++) {
+            const texto = normalizarTexto(ths[i].innerText);
+
+            if (nomesPossiveis.some(nome => texto.includes(normalizarTexto(nome)))) {
+                return i;
+            }
+        }
+
+        const primeiraLinha = tabela.querySelector("tr");
+        if (!primeiraLinha) return -1;
+
+        const celulas = [...primeiraLinha.children];
+
+        for (let i = 0; i < celulas.length; i++) {
+            const texto = normalizarTexto(celulas[i].innerText);
+
+            if (nomesPossiveis.some(nome => texto.includes(normalizarTexto(nome)))) {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    function obterLinhasTabela(tabela) {
+        let linhas = [...tabela.querySelectorAll("tbody tr")];
+
+        if (!linhas.length) {
+            linhas = [...tabela.querySelectorAll("tr")].slice(1);
+        }
+
+        return linhas.filter(linha => {
+            const texto = normalizarTexto(linha.innerText);
+            return texto && !texto.includes("usuario venda liquida");
+        });
+    }
+
+    function criarMapaTurno(lista) {
+        const mapa = new Map();
+
+        lista.forEach(nome => {
+            mapa.set(normalizarTexto(nome), nome);
+        });
+
+        return mapa;
+    }
+
+    function calcular() {
+        const tabela = encontrarTabela();
+
+        if (!tabela) {
+            alert("Não encontrei uma tabela com as colunas USUÁRIO e VENDA LÍQUIDA.");
+            return;
+        }
+
+        const indiceUsuario = encontrarIndiceColuna(tabela, ["Usuário", "Usuario"]);
+        const indiceVendaLiquida = encontrarIndiceColuna(tabela, ["Venda Líquida", "Venda Liquida"]);
+
+        if (indiceUsuario === -1 || indiceVendaLiquida === -1) {
+            alert("Não consegui identificar as colunas USUÁRIO e VENDA LÍQUIDA.");
+            return;
+        }
+
+        const mapaManha = criarMapaTurno(manha);
+        const mapaNoite = criarMapaTurno(noite);
+
+        const totais = {};
+        const linhas = obterLinhasTabela(tabela);
+
+        linhas.forEach(linha => {
+            const celulas = [...linha.children];
+
+            if (!celulas[indiceUsuario] || !celulas[indiceVendaLiquida]) return;
+
+            const usuarioOriginal = celulas[indiceUsuario].innerText.trim();
+            const usuarioKey = normalizarTexto(usuarioOriginal);
+
+            const vendaLiquidaTexto = celulas[indiceVendaLiquida].innerText.trim();
+            const valor = parseMoedaBR(vendaLiquidaTexto);
+
+            if (!totais[usuarioKey]) {
+                totais[usuarioKey] = {
+                    nome: usuarioOriginal,
+                    total: 0,
+                    turno: "Sem turno"
+                };
+            }
+
+            totais[usuarioKey].total += valor;
+
+            if (mapaManha.has(usuarioKey)) {
+                totais[usuarioKey].turno = "Manhã";
+                totais[usuarioKey].nome = mapaManha.get(usuarioKey);
+            } else if (mapaNoite.has(usuarioKey)) {
+                totais[usuarioKey].turno = "Noite";
+                totais[usuarioKey].nome = mapaNoite.get(usuarioKey);
+            }
+        });
+
+        renderizarPainel(totais);
+    }
+
+    function ordenarPorValor(lista) {
+        return lista.sort((a, b) => b.total - a.total);
+    }
+
+    function montarBlocoTitulo(titulo, total, quantidade) {
+        return `
+            <div class="vl-turno-titulo">
+                <div>
+                    <strong>${titulo}</strong>
+                    <span>${quantidade} funcionário(s)</span>
+                </div>
+                <b>${formatarMoeda(total)}</b>
+            </div>
+        `;
+    }
+
+    function montarTabelaFuncionarios(lista) {
+        if (!lista.length) {
+            return `<div class="vl-vazio">Nenhum funcionário encontrado.</div>`;
+        }
+
+        return `
+            <table class="vl-tabela">
+                <thead>
+                    <tr>
+                        <th>Funcionário</th>
+                        <th>Venda Líquida</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${lista.map(item => `
+                        <tr>
+                            <td>${item.nome}</td>
+                            <td>${formatarMoeda(item.total)}</td>
+                        </tr>
+                    `).join("")}
+                </tbody>
+            </table>
+        `;
+    }
+
+    function renderizarPainel(totais) {
+        const antigo = document.getElementById(ID_PAINEL);
+        if (antigo) antigo.remove();
+
+        const lista = Object.values(totais);
+
+        const listaManha = ordenarPorValor(lista.filter(item => item.turno === "Manhã"));
+        const listaNoite = ordenarPorValor(lista.filter(item => item.turno === "Noite"));
+        const listaSemTurno = ordenarPorValor(lista.filter(item => item.turno === "Sem turno"));
+
+        const totalManha = listaManha.reduce((acc, item) => acc + item.total, 0);
+        const totalNoite = listaNoite.reduce((acc, item) => acc + item.total, 0);
+        const totalSemTurno = listaSemTurno.reduce((acc, item) => acc + item.total, 0);
+        const totalGeral = totalManha + totalNoite + totalSemTurno;
+
+        const diferencaNoiteManha = totalNoite - totalManha;
+
+        let textoDiferenca = "";
+
+        if (diferencaNoiteManha > 0) {
+            textoDiferenca = `Noite está ${formatarMoeda(diferencaNoiteManha)} acima da Manhã`;
+        } else if (diferencaNoiteManha < 0) {
+            textoDiferenca = `Manhã está ${formatarMoeda(Math.abs(diferencaNoiteManha))} acima da Noite`;
+        } else {
+            textoDiferenca = "Manhã e Noite estão empatadas";
+        }
+
+        const painel = document.createElement("div");
+        painel.id = ID_PAINEL;
+
+        painel.innerHTML = `
+            <div class="vl-header">
+                <div>
+                    <strong>Venda Líquida</strong>
+                    <span>Resumo por funcionário</span>
+                </div>
+
+                <div class="vl-acoes">
+                    <button id="vl-atualizar">Atualizar</button>
+                    <button id="vl-fechar">×</button>
+                </div>
+            </div>
+
+            <div class="vl-total-geral">
+                <span>Total geral</span>
+                <strong>${formatarMoeda(totalGeral)}</strong>
+            </div>
+
+            <div class="vl-diferenca ${diferencaNoiteManha >= 0 ? "positivo" : "negativo"}">
+                <div>
+                    <span>Diferença Noite - Manhã</span>
+                    <small>${textoDiferenca}</small>
+                </div>
+                <strong>${formatarMoeda(diferencaNoiteManha)}</strong>
+            </div>
+
+            <div class="vl-bloco">
+                ${montarBlocoTitulo("Manhã", totalManha, listaManha.length)}
+                ${montarTabelaFuncionarios(listaManha)}
+            </div>
+
+            <div class="vl-bloco">
+                ${montarBlocoTitulo("Noite", totalNoite, listaNoite.length)}
+                ${montarTabelaFuncionarios(listaNoite)}
+            </div>
+
+            ${listaSemTurno.length ? `
+                <div class="vl-bloco">
+                    ${montarBlocoTitulo("Sem turno", totalSemTurno, listaSemTurno.length)}
+                    ${montarTabelaFuncionarios(listaSemTurno)}
+                </div>
+            ` : ""}
+        `;
+
+        document.body.appendChild(painel);
+
+        tornarArrastavel(
+            painel,
+            painel.querySelector(".vl-header")
+        );
+
+        document.getElementById("vl-fechar").onclick = () => painel.remove();
+        document.getElementById("vl-atualizar").onclick = calcular;
+    }
+
+    function criarBotaoFlutuante() {
+        if (document.getElementById("btn-somar-venda-liquida")) return;
+
+        const botao = document.createElement("button");
+        botao.id = "btn-somar-venda-liquida";
+        botao.textContent = "Somar Venda Líquida";
+
+        botao.onclick = calcular;
+
+        document.body.appendChild(botao);
+    }
+
+    function adicionarCSS() {
+        const css = document.createElement("style");
+
+        css.textContent = `
+            #btn-somar-venda-liquida {
+                position: fixed;
+                right: 18px;
+                bottom: 18px;
+                z-index: 999999;
+                background: #263aa8;
+                color: #fff;
+                border: none;
+                border-radius: 10px;
+                padding: 10px 14px;
+                font-size: 13px;
+                font-weight: 700;
+                cursor: pointer;
+                box-shadow: 0 8px 22px rgba(0,0,0,.25);
+            }
+
+            #btn-somar-venda-liquida:hover {
+                background: #1f2f91;
+            }
+
+            #${ID_PAINEL} {
+                position: fixed;
+                top: 70px;
+                right: 20px;
+                width: 430px;
+                max-height: 82vh;
+                overflow: auto;
+                z-index: 999999;
+                background: #ffffff;
+                color: #222;
+                border-radius: 14px;
+                box-shadow: 0 12px 35px rgba(0,0,0,.28);
+                border: 1px solid #ddd;
+                font-family: Arial, sans-serif;
+            }
+
+            #${ID_PAINEL} .vl-header {
+                background: #263aa8;
+                color: #fff;
+                padding: 14px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                position: sticky;
+                top: 0;
+                z-index: 2;
+            }
+
+            #${ID_PAINEL} .vl-header strong {
+                display: block;
+                font-size: 16px;
+            }
+
+            #${ID_PAINEL} .vl-header span {
+                display: block;
+                font-size: 11px;
+                opacity: .85;
+                margin-top: 2px;
+            }
+
+            #${ID_PAINEL} .vl-acoes {
+                display: flex;
+                gap: 6px;
+            }
+
+            #${ID_PAINEL} .vl-acoes button {
+                border: none;
+                border-radius: 8px;
+                padding: 6px 9px;
+                cursor: pointer;
+                font-weight: 700;
+                color: #263aa8;
+                background: #fff;
+            }
+
+            #${ID_PAINEL} .vl-acoes #vl-fechar {
+                font-size: 18px;
+                line-height: 14px;
+            }
+
+            #${ID_PAINEL} .vl-total-geral {
+                margin: 12px;
+                padding: 13px;
+                border-radius: 12px;
+                background: #f3f5ff;
+                border: 1px solid #d8ddff;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+
+            #${ID_PAINEL} .vl-total-geral span {
+                font-size: 13px;
+                color: #555;
+            }
+
+            #${ID_PAINEL} .vl-total-geral strong {
+                font-size: 18px;
+                color: #263aa8;
+            }
+
+            #${ID_PAINEL} .vl-diferenca {
+                margin: 12px;
+                padding: 13px;
+                border-radius: 12px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                gap: 10px;
+            }
+
+            #${ID_PAINEL} .vl-diferenca.positivo {
+                background: #eefaf1;
+                border: 1px solid #bce8c7;
+            }
+
+            #${ID_PAINEL} .vl-diferenca.negativo {
+                background: #fff1f1;
+                border: 1px solid #ffcaca;
+            }
+
+            #${ID_PAINEL} .vl-diferenca span {
+                display: block;
+                font-size: 13px;
+                color: #333;
+                font-weight: 700;
+            }
+
+            #${ID_PAINEL} .vl-diferenca small {
+                display: block;
+                margin-top: 3px;
+                font-size: 11px;
+                color: #666;
+            }
+
+            #${ID_PAINEL} .vl-diferenca strong {
+                font-size: 17px;
+                white-space: nowrap;
+            }
+
+            #${ID_PAINEL} .vl-bloco {
+                margin: 12px;
+                border: 1px solid #e3e3e3;
+                border-radius: 12px;
+                overflow: hidden;
+            }
+
+            #${ID_PAINEL} .vl-turno-titulo {
+                background: #f7f7f7;
+                padding: 10px 12px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                border-bottom: 1px solid #e3e3e3;
+            }
+
+            #${ID_PAINEL} .vl-turno-titulo strong {
+                display: block;
+                font-size: 14px;
+            }
+
+            #${ID_PAINEL} .vl-turno-titulo span {
+                display: block;
+                color: #777;
+                font-size: 11px;
+                margin-top: 2px;
+            }
+
+            #${ID_PAINEL} .vl-turno-titulo b {
+                font-size: 14px;
+                color: #111;
+            }
+
+            #${ID_PAINEL} .vl-tabela {
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 12px;
+            }
+
+            #${ID_PAINEL} .vl-tabela th {
+                text-align: left;
+                padding: 8px 10px;
+                background: #fff;
+                border-bottom: 1px solid #eee;
+                color: #555;
+                font-size: 11px;
+                text-transform: uppercase;
+            }
+
+            #${ID_PAINEL} .vl-tabela td {
+                padding: 8px 10px;
+                border-bottom: 1px solid #f0f0f0;
+            }
+
+            #${ID_PAINEL} .vl-tabela td:last-child {
+                text-align: right;
+                font-weight: 700;
+                white-space: nowrap;
+            }
+
+            #${ID_PAINEL} .vl-tabela tr:last-child td {
+                border-bottom: none;
+            }
+
+            #${ID_PAINEL} .vl-vazio {
+                padding: 12px;
+                font-size: 12px;
+                color: #777;
+            }
+        `;
+
+        document.head.appendChild(css);
+    }
+    function tornarArrastavel(elemento, handle) {
+        let movendo = false;
+        let offsetX = 0;
+        let offsetY = 0;
+
+        handle.style.cursor = "move";
+
+        handle.addEventListener("mousedown", function (e) {
+            // Não arrasta quando clicar nos botões
+            if (e.target.tagName === "BUTTON") return;
+
+            movendo = true;
+
+            const rect = elemento.getBoundingClientRect();
+
+            offsetX = e.clientX - rect.left;
+            offsetY = e.clientY - rect.top;
+
+            elemento.style.left = rect.left + "px";
+            elemento.style.top = rect.top + "px";
+            elemento.style.right = "auto";
+
+            document.body.style.userSelect = "none";
+        });
+
+        document.addEventListener("mousemove", function (e) {
+            if (!movendo) return;
+
+            elemento.style.left = (e.clientX - offsetX) + "px";
+            elemento.style.top = (e.clientY - offsetY) + "px";
+        });
+
+        document.addEventListener("mouseup", function () {
+            movendo = false;
+            document.body.style.userSelect = "";
+        });
+    }
+
+    function iniciar() {
+        adicionarCSS();
+        criarBotaoFlutuante();
+    }
+
+    iniciar();
+
+})();
