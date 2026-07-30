@@ -1,0 +1,123 @@
+// ==UserScript==
+// @name         Pesquisa de Bilhetes - Auto Datas + Status
+// @namespace    http://tampermonkey.net/
+// @version      7.1
+// @description  Atua apenas na página "Pesquisa de bilhetes"
+// @author       ChatGPT
+// @match        *://*/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // =====================================================
+    // VERIFICA SE É A PÁGINA CORRETA
+    // =====================================================
+    function paginaCorreta() {
+
+        const titulo = document.querySelector('h3.page-title');
+
+        return titulo &&
+               titulo.innerText.trim() === 'Pesquisa de bilhetes';
+    }
+
+    // =====================================================
+    // FUNÇÃO PRINCIPAL
+    // =====================================================
+    function alterarCampos() {
+
+        // executa somente na página desejada
+        if (!paginaCorreta()) return;
+
+        // =====================================================
+        // ZERAR CAMPOS DE DATA
+        // =====================================================
+        const camposData = document.querySelectorAll(`
+            input.hasDatepicker,
+            input[id^="dp"],
+            input[placeholder*="dd"],
+            input[placeholder*="DD"]
+        `);
+
+        camposData.forEach(campo => {
+
+            if (campo.type === 'hidden') return;
+
+            if (campo.value !== '00/00/0000') {
+
+                campo.value = '00/00/0000';
+
+                campo.dispatchEvent(new Event('focus', { bubbles: true }));
+                campo.dispatchEvent(new Event('input', { bubbles: true }));
+                campo.dispatchEvent(new Event('change', { bubbles: true }));
+                campo.dispatchEvent(new Event('blur', { bubbles: true }));
+
+                console.log('[TM] Data zerada');
+            }
+        });
+
+        // =====================================================
+        // ALTERAR SELECT2 PARA TODOS
+        // =====================================================
+        const selects = document.querySelectorAll('select');
+
+        selects.forEach(select => {
+
+            const optionTodos = [...select.options].find(opt =>
+                opt.text.trim().toUpperCase() === 'TODOS'
+            );
+
+            if (optionTodos) {
+
+                select.value = optionTodos.value;
+
+                select.dispatchEvent(new Event('change', {
+                    bubbles: true
+                }));
+
+                select.dispatchEvent(new Event('input', {
+                    bubbles: true
+                }));
+
+                // Atualiza visualmente Select2
+                if (
+                    window.jQuery &&
+                    jQuery(select).hasClass('select2-hidden-accessible')
+                ) {
+                    jQuery(select).trigger('change.select2');
+                }
+
+                console.log('[TM] Select alterado para TODOS');
+            }
+        });
+    }
+
+    // =====================================================
+    // EXECUTA AO CARREGAR
+    // =====================================================
+    window.addEventListener('load', () => {
+        setTimeout(alterarCampos, 1500);
+    });
+
+    // =====================================================
+    // OBSERVA ALTERAÇÕES AJAX / DOM
+    // =====================================================
+    const observer = new MutationObserver(() => {
+
+        if (!paginaCorreta()) return;
+
+        clearTimeout(window.__tmObserverDelay);
+
+        window.__tmObserverDelay = setTimeout(() => {
+            alterarCampos();
+        }, 300);
+
+    });
+
+    observer.observe(document.body, {
+        childList: true,
+        subtree: true
+    });
+
+})();
