@@ -1,0 +1,519 @@
+// ==UserScript==
+// @name         Colocar trecho automatico
+// @namespace    http://tampermonkey.net/
+// @version      1.2
+// @description  Adiciona um botão para copiar todos os dados da primeira .card-coupon-area (dark mode)
+// @match        *://*/*
+// @grant        GM_setClipboard
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    function criarBotao() {
+        const div = document.querySelectorAll('.card-coupon-area')[0];
+
+        if (!div) {
+            // Se ainda não existe, tenta de novo em breve (útil em sites com carregamento dinâmico)
+            return false;
+        }
+
+        // Evita adicionar o botão mais de uma vez
+        if (div.querySelector('.tm-copiar-btn')) {
+            return true;
+        }
+
+        const botao = document.createElement('button');
+        botao.textContent = 'Copiar dados';
+        botao.className = 'tm-copiar-btn';
+        botao.style.cssText = `
+            margin-top: 35px;
+            padding: 10px 14px;
+            background: darkgreen;
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: bold;
+            box-shadow: 0 6px 16px rgba(16, 185, 129, 0.35);
+            transition: transform 0.15s ease, box-shadow 0.15s ease;
+            z-index: 9999;
+        `;
+        botao.addEventListener('mouseenter', () => {
+            botao.style.transform = 'translateY(-1px)';
+            botao.style.boxShadow = '0 8px 20px rgba(16, 185, 129, 0.45)';
+        });
+        botao.addEventListener('mouseleave', () => {
+            botao.style.transform = 'none';
+            botao.style.boxShadow = '0 6px 16px rgba(16, 185, 129, 0.35)';
+        });
+
+        botao.addEventListener('click', function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const textoBruto = div.innerText;
+            const dados = formatarTrechos(textoBruto);
+
+            // Copia para a área de transferência
+            if (typeof GM_setClipboard !== 'undefined') {
+                GM_setClipboard(dados, 'text');
+            } else {
+                navigator.clipboard.writeText(dados);
+            }
+
+            const textoOriginal = botao.textContent;
+            botao.textContent = 'Copiado!';
+            setTimeout(() => {
+                botao.textContent = textoOriginal;
+            }, 1500);
+        });
+
+        // Siglas válidas de UF brasileiras, usadas para achar com segurança o ponto onde a UF
+        // da origem termina e a próxima cidade começa (quando estão coladas sem espaço).
+        const UFS = ['AC','AL','AP','AM','BA','CE','DF','ES','GO','MA','MT','MS','MG','PA','PB',
+            'PR','PE','PI','RJ','RN','RS','RO','RR','SC','SP','SE','TO'];
+        const UF_ALT = UFS.join('|');
+
+        // Acha o ponto de corte entre origem e destino dentro de uma linha "Trecho ..." em que
+        // os dois nomes vêm colados, sem separador (ex: "...- CESOBRAL - CE" ou
+        // "...Olímpica)BELO HORIZONTE - MG"). Existem dois padrões possíveis de colagem:
+        //  1) UF válida colada direto na cidade seguinte, ex: "- CE" + "SOBRAL"
+        //  2) Parênteses fechando colado direto na cidade seguinte, ex: "Olímpica)" + "BELO"
+        // Usa o que aparecer primeiro no texto (nem toda origem tem UF própria, como no caso
+        // de "Rio de Janeiro (RIO2 - Barra Olímpica)", que não tem "- UF" antes do destino).
+        function dividirOrigemDestino(texto) {
+            const regexUFGrudada = new RegExp(`\\s-\\s(?:${UF_ALT})(?=[A-Za-zÀ-ÿ])`);
+            const matchUF = texto.match(regexUFGrudada);
+
+            const regexParenGrudado = /\)(?=[A-ZÀ-Ü])/;
+            const matchParen = texto.match(regexParenGrudado);
+
+            const corteUF = matchUF ? matchUF.index + matchUF[0].length : -1;
+            const corteParen = matchParen ? matchParen.index + 1 : -1;
+
+            let corte = -1;
+            if (corteUF !== -1 && corteParen !== -1) {
+                corte = Math.min(corteUF, corteParen);
+            } else if (corteUF !== -1) {
+                corte = corteUF;
+            } else if (corteParen !== -1) {
+                corte = corteParen;
+            }
+
+            if (corte === -1) return null;
+
+            return {
+                origemTexto: texto.slice(0, corte).trim(),
+                destinoTexto: texto.slice(corte).trim()
+            };
+        }
+
+        // Normaliza um texto de local para comparação (maiúsculas, sem espaços duplicados)
+        function normalizarLocal(texto) {
+            return String(texto || '').trim().toUpperCase().replace(/\s+/g, ' ');
+        }
+
+        // Extrai os trechos (origem/destino) e as datas de IDA/VOLTA do texto bruto
+        function formatarTrechos(texto) {
+            const linhas = texto.split('\n').map(l => l.trim()).filter(Boolean);
+
+            const blocos = [];
+            let atual = null;
+
+            linhas.forEach(linha => {
+                if (linha.startsWith('Trecho ')) {
+                    if (atual) blocos.push(atual);
+                    // Remove o prefixo "Trecho " para não atrapalhar a divisão origem/destino
+                    atual = { linha: linha.replace(/^Trecho\s+/, '').trim(), data: null };
+                } else if (atual && !atual.data && /^\d{2}\/\d{2}\/\d{4}$/.test(linha)) {
+                    atual.data = linha;
+                }
+            });
+            if (atual) blocos.push(atual);
+
+            const trechos = blocos.map(bloco => {
+                const divisao = dividirOrigemDestino(bloco.linha);
+                if (!divisao) return null;
+                return { origem: divisao.origemTexto, destino: divisao.destinoTexto, data: bloco.data };
+            }).filter(t => t && t.origem && t.destino);
+
+            if (trechos.length === 0) {
+                return texto.trim(); // fallback: se não conseguir identificar, copia o texto bruto
+            }
+
+            const primeiro = trechos[0];
+            const ultimo = trechos[trechos.length - 1];
+
+            // É ida e volta de verdade só se o destino do último trecho voltar pra origem do
+            // primeiro (fecha o ciclo). Se não fechar, é uma conexão: junta origem do 1º com
+            // destino do último e usa só a data de IDA.
+            const ehIdaEVolta = trechos.length === 2 &&
+                normalizarLocal(ultimo.destino) === normalizarLocal(primeiro.origem);
+
+            let resultado;
+
+            if (ehIdaEVolta) {
+                resultado = `TRECHO: ${primeiro.origem} para ${primeiro.destino}\n\n`;
+                resultado += `IDA: ${primeiro.data || '-'}`;
+                resultado += `\nVOLTA: ${trechos[1].data || '-'}`;
+            } else {
+                resultado = `TRECHO: ${primeiro.origem} para ${ultimo.destino}\n\n`;
+                resultado += `IDA: ${primeiro.data || '-'}`;
+            }
+
+            return resultado;
+        }
+
+        div.appendChild(botao);
+        return true;
+    }
+
+    function criarTextareaEBotao() {
+        const div = document.querySelectorAll('.col-button-only')[2];
+
+        if (!div) {
+            return false;
+        }
+
+        if (div.querySelector('.tm-preencher-area')) {
+            return true;
+        }
+
+        const wrapper = document.createElement('div');
+        wrapper.className = 'tm-preencher-area';
+        wrapper.style.cssText = `
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-top: 8px;
+            padding: 10px;
+            background: #1c1a1e;
+            border: 1px solid #322f36;
+            border-radius: 12px;
+            box-shadow: 0 10px 24px rgba(0, 0, 0, 0.4);
+        `;
+
+        const textarea = document.createElement('textarea');
+        textarea.placeholder = 'Cole aqui:';
+        textarea.style.cssText = `
+            width: 100%;
+            min-height: 60px;
+            padding: 8px;
+            font-size: 13px;
+            box-sizing: border-box;
+            background: #232025;
+            color: #f3ece6;
+            border: 1px solid #3a3640;
+            border-radius: 8px;
+            outline: none;
+            resize: vertical;
+            font-family: inherit;
+            transition: border-color 0.15s ease, box-shadow 0.15s ease;
+        `;
+        textarea.addEventListener('focus', () => {
+            textarea.style.borderColor = '#ff6a1f';
+            textarea.style.boxShadow = '0 0 0 3px rgba(255, 106, 31, 0.2)';
+        });
+        textarea.addEventListener('blur', () => {
+            textarea.style.borderColor = '#3a3640';
+            textarea.style.boxShadow = 'none';
+        });
+
+        const botaoPreencher = document.createElement('button');
+        botaoPreencher.textContent = 'Preencher';
+        botaoPreencher.style.cssText = `
+            padding: 8px 14px;
+            background: linear-gradient(135deg, #ff8a3d, #ff6a1f);
+            color: #1c1a1e;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: bold;
+            box-shadow: 0 6px 16px rgba(255, 106, 31, 0.35);
+            transition: transform 0.15s ease, box-shadow 0.15s ease;
+        `;
+        botaoPreencher.addEventListener('mouseenter', () => {
+            botaoPreencher.style.transform = 'translateY(-1px)';
+            botaoPreencher.style.boxShadow = '0 8px 20px rgba(255, 106, 31, 0.45)';
+        });
+        botaoPreencher.addEventListener('mouseleave', () => {
+            botaoPreencher.style.transform = 'none';
+            botaoPreencher.style.boxShadow = '0 6px 16px rgba(255, 106, 31, 0.35)';
+        });
+
+        botaoPreencher.addEventListener('click', function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const info = extrairOrigemDestino(textarea.value);
+            const datas = extrairDatas(textarea.value);
+
+            if (!info) {
+                alert('Não foi possível identificar origem/destino no texto colado.');
+                return;
+            }
+
+            preencherTudo(info, datas);
+        });
+
+        wrapper.appendChild(textarea);
+        wrapper.appendChild(botaoPreencher);
+        div.appendChild(wrapper);
+        return true;
+    }
+
+    // Extrai origem (com UF) e destino (só cidade) do texto "TRECHO: NATAL - RN para FORTALEZA"
+    function extrairOrigemDestino(texto) {
+        const match = texto.match(/TRECHO:\s*(.+?)\s+para\s+(.+)/i);
+        if (!match) return null;
+        return {
+            origem: match[1].trim(),
+            destino: match[2].trim()
+        };
+    }
+
+    // Extrai as datas "IDA: dd/mm/aaaa" e "VOLTA: dd/mm/aaaa" (volta é opcional)
+    function extrairDatas(texto) {
+        const idaMatch = texto.match(/IDA:\s*(\d{2}\/\d{2}\/\d{4})/i);
+        const voltaMatch = texto.match(/VOLTA:\s*(\d{2}\/\d{2}\/\d{4})/i);
+        return {
+            ida: idaMatch ? idaMatch[1].trim() : null,
+            volta: voltaMatch ? voltaMatch[1].trim() : null
+        };
+    }
+
+    // Fluxo completo: preenche origem -> destino -> data de ida -> data de volta (se tiver)
+    function preencherTudo(info, datas) {
+        const origem = separarCidadeUF(info.origem);
+        const destino = separarCidadeUF(info.destino);
+
+        abrirEPreencherSelect2(5, origem.cidade, origem.uf, () => {
+            setTimeout(() => {
+                abrirEPreencherSelect2(6, destino.cidade, destino.uf, () => {
+                    setTimeout(() => {
+                        if (datas.ida) {
+                            preencherData(14, datas.ida);
+                        }
+                        if (datas.volta) {
+                            preencherData(16, datas.volta);
+                        }
+                    }, 80);
+                });
+            }, 80);
+        });
+    }
+
+    // Separa "CIDADE (COMPLEMENTO) - UF" em { cidade, uf }.
+    // IMPORTANTE: o complemento entre parênteses é MANTIDO em `cidade` de propósito —
+    // é ele que diferencia terminais como "FORTALEZA (TA ANTONIO BEZERRA)" do terminal
+    // padrão "FORTALEZA". Removê-lo faz o select2 sempre cair na opção canônica.
+    function separarCidadeUF(texto) {
+        const match = texto.trim().match(/^(.*)\s-\s([A-Z]{2})$/);
+
+        if (match) {
+            return { cidade: match[1].trim().toUpperCase(), uf: match[2] };
+        }
+
+        return { cidade: texto.trim().toUpperCase(), uf: null };
+    }
+
+    // Preenche um campo de data (.ng-valid pelo índice) e dispara os eventos que o Angular escuta
+    function preencherData(indice, dataStr) {
+        const campos = document.querySelectorAll('.ng-valid');
+        const campo = campos[indice];
+
+        if (!campo) {
+            console.warn('[Tampermonkey] .ng-valid índice', indice, 'não encontrado para a data', dataStr);
+            alert(`Campo de data (índice ${indice}) não encontrado para "${dataStr}".`);
+            return false;
+        }
+
+        campo.focus();
+        campo.value = dataStr;
+
+        // Dispara os eventos que o Angular/datepicker escutam para reconhecer o valor digitado
+        campo.dispatchEvent(new Event('input', { bubbles: true }));
+        campo.dispatchEvent(new Event('change', { bubbles: true }));
+        campo.blur();
+
+        return true;
+    }
+
+    // Clica no .select2-selection do índice informado para abrir o dropdown
+    function abrirSelect2(indice) {
+        const elems = document.querySelectorAll('.select2-selection');
+        const elem = elems[indice];
+
+        if (!elem) {
+            console.warn('[Tampermonkey] .select2-selection índice', indice, 'não encontrado');
+            return null;
+        }
+
+        elem.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+        elem.click();
+        return elem;
+    }
+
+    // Abre o select do índice indicado, digita a cidade (com complemento, se houver) e seleciona
+    // a opção correspondente
+    function abrirEPreencherSelect2(indice, nomeCidade, uf, callback) {
+        const elem = abrirSelect2(indice);
+
+        if (!elem) {
+            alert(`Select de índice ${indice} não encontrado na página.`);
+            return;
+        }
+
+        aguardarCampoBusca(nomeCidade, uf, callback);
+    }
+
+    // Espera o campo .select2-search__field aparecer (dropdown abrir), digita e dispara os eventos.
+    // Digitamos o nome COMPLETO (incluindo o complemento entre parênteses, se houver), pois é assim
+    // que o campo de busca filtra corretamente para um terminal específico (ex: "FORTALEZA (TA
+    // ANTONIO BEZERRA)"), igual ao comportamento manual.
+    function aguardarCampoBusca(nomeCidade, uf, callback, tentativas = 30) {
+        const campos = document.querySelectorAll('.select2-search__field');
+        const campo = Array.from(campos).find(c => c.offsetParent !== null);
+
+        if (campo) {
+            campo.focus();
+            campo.value = nomeCidade;
+            campo.dispatchEvent(new Event('input', { bubbles: true }));
+            campo.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+            aguardarESelecionarOpcao(nomeCidade, uf, callback);
+            return;
+        }
+
+        if (tentativas <= 0) {
+            console.warn('[Tampermonkey] Campo de busca não apareceu para', nomeCidade);
+            alert(`O campo de busca do select não abriu para "${nomeCidade}".`);
+            return;
+        }
+
+        setTimeout(() => aguardarCampoBusca(nomeCidade, uf, callback, tentativas - 1), 50);
+    }
+
+    // Tenta encontrar a opção com o nome da cidade na lista renderizada pelo select2.
+    // Como a filtragem é assíncrona, tenta algumas vezes com um pequeno intervalo.
+    function aguardarESelecionarOpcao(nomeCidade, uf, callback, tentativas = 30) {
+        const opcoes = Array.from(document.querySelectorAll('.select2-results__option'))
+            .filter(op => !op.classList.contains('select2-results__message'));
+
+        const opcao = encontrarOpcao(opcoes, nomeCidade, uf);
+
+        if (opcao) {
+            // Simula os eventos de mouse que o select2 escuta para confirmar a seleção
+            ['mouseenter', 'mousedown', 'mouseup', 'click'].forEach(tipo => {
+                opcao.dispatchEvent(new MouseEvent(tipo, { bubbles: true, cancelable: true }));
+            });
+            if (callback) setTimeout(() => callback(true), 50);
+            return;
+        }
+
+        if (tentativas <= 0) {
+            console.warn('[Tampermonkey] Nenhuma opção encontrada para a cidade:', nomeCidade);
+            alert(`Não encontrei "${nomeCidade}" na lista de opções do select.`);
+            if (callback) callback(false);
+            return;
+        }
+
+        setTimeout(() => aguardarESelecionarOpcao(nomeCidade, uf, callback, tentativas - 1), 60);
+    }
+
+    // Compara pelo nome exato da cidade, extraído de forma robusta do texto da opção.
+    // Formatos possíveis: "CÓD - CIDADE - UF" ou "CÓD - CIDADE (COMPLEMENTO) - UF"
+    //
+    // Estratégia:
+    // 1) Se `nomeCidade` já tem um complemento entre parênteses (ex: "FORTALEZA (TA ANTONIO
+    //    BEZERRA)"), tenta achar a opção cujo nome COMPLETO (cidade + complemento) bate
+    //    exatamente. Isso resolve o caso de terminais alternativos.
+    // 2) Se não tiver complemento, cai no comportamento anterior: compara só pela cidade (sem
+    //    parênteses) e, se houver ambiguidade, prefere a opção canônica (sem complemento) ou
+    //    desempata pela UF.
+    function encontrarOpcao(opcoes, nomeCidade, uf) {
+        if (nomeCidade.includes('(')) {
+            const exatoComComplemento = opcoes.find(
+                op => extrairCidadeCompletaDaOpcao(op.textContent) === nomeCidade
+            );
+            if (exatoComComplemento) {
+                return exatoComComplemento;
+            }
+            // Se não achou o complemento exato, continua para o fallback abaixo
+            // comparando apenas pela cidade (sem o complemento).
+        }
+
+        const nomeSemComplemento = nomeCidade.replace(/\s*\([^)]*\)\s*/g, ' ').trim();
+
+        const candidatosExatos = opcoes.filter(op => extrairCidadeDaOpcao(op.textContent) === nomeSemComplemento);
+
+        if (candidatosExatos.length === 1) {
+            return candidatosExatos[0];
+        }
+
+        if (candidatosExatos.length > 1) {
+            const semParenteses = candidatosExatos.filter(op => !op.textContent.includes('('));
+
+            if (semParenteses.length === 1) {
+                return semParenteses[0];
+            }
+
+            if (uf) {
+                const porUF = (semParenteses.length > 0 ? semParenteses : candidatosExatos)
+                    .find(op => extrairUFDaOpcao(op.textContent) === uf);
+                if (porUF) return porUF;
+            }
+
+            if (semParenteses.length > 0) {
+                return semParenteses[0];
+            }
+
+            return candidatosExatos[0];
+        }
+
+        // fallback: se não achou nenhuma correspondência exata, tenta por "contém"
+        return opcoes.find(op => op.textContent.toUpperCase().includes(nomeSemComplemento));
+    }
+
+    // Extrai o nome da cidade do texto de uma opção do select2, SEM o complemento entre
+    // parênteses. Remove o "CÓDIGO - " do início, depois corta no primeiro "(" ou " - ".
+    function extrairCidadeDaOpcao(texto) {
+        const semCodigo = texto.trim().replace(/^.*?-\s*/, '');
+        const match = semCodigo.match(/^(.*?)(?:\s\(|\s-\s|$)/);
+        return (match ? match[1] : semCodigo).trim().toUpperCase();
+    }
+
+    // Extrai o nome da cidade COM o complemento entre parênteses (se existir), mas sem a UF
+    // e sem o código do terminal. Ex: "ABEZ - FORTALEZA (TA ANTONIO BEZERRA) - CE"
+    // -> "FORTALEZA (TA ANTONIO BEZERRA)"
+    function extrairCidadeCompletaDaOpcao(texto) {
+        const semCodigo = texto.trim().replace(/^.*?-\s*/, '');
+        const semUF = semCodigo.replace(/\s-\s[A-Z]{2}\s*$/, '');
+        return semUF.trim().toUpperCase();
+    }
+
+    // Extrai a UF do final do texto da opção, se existir (ex: "... - RJ" -> "RJ")
+    function extrairUFDaOpcao(texto) {
+        const match = texto.trim().match(/-\s*([A-Z]{2})\s*$/);
+        return match ? match[1] : null;
+    }
+
+    // Tenta criar os elementos imediatamente
+    const botaoOk = criarBotao();
+    const textareaOk = criarTextareaEBotao();
+
+    if (!botaoOk || !textareaOk) {
+        // Caso alguma div ainda não exista no carregamento, observa mudanças no DOM
+        const observer = new MutationObserver(() => {
+            const a = criarBotao();
+            const b = criarTextareaEBotao();
+            if (a && b) {
+                observer.disconnect();
+            }
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+    }
+})();
