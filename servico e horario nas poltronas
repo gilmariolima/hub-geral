@@ -1,0 +1,74 @@
+// ==UserScript==
+// @name         Guanabara - Horário + Serviço no mapa
+// @namespace    https://tampermonkey.net/
+// @version      1.5
+// @description  Exibe o primeiro horário e o tipo de serviço à direita das cidades e oculta a informação da via.
+// @match        https://prod-guanabara-frontoffice-smartbus.smarttravelit.com/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // Oculta permanentemente a informação da via
+    const style = document.createElement("style");
+    style.textContent = `
+        .seat-map-route h4 > div {
+            display: none !important;
+        }
+    `;
+    document.head.appendChild(style);
+
+    function atualizar() {
+
+        document.querySelectorAll("app-servicerow").forEach(servicerow => {
+
+            const titulo = servicerow.querySelector(".seat-map-route h4");
+            const horarioCol = servicerow.querySelector(".service-info .service-col-3");
+            const servico = servicerow.querySelector(".service-info .service-col-7 span");
+
+            if (!titulo || !horarioCol || !servico) return;
+
+            // Primeiro horário (HH:MM)
+            const textoOriginal = horarioCol.textContent.replace(/\s+/g, " ").trim();
+            const primeiroHorario = (textoOriginal.match(/\d{2}:\d{2}/) || [""])[0];
+
+            const texto = ` | ${primeiroHorario} | ${servico.textContent.trim()}`;
+
+            // Mantém tudo na mesma linha
+            titulo.style.display = "flex";
+            titulo.style.alignItems = "center";
+            titulo.style.flexWrap = "nowrap";
+
+            let info = titulo.querySelector(".tm-info");
+
+            if (!info) {
+                info = document.createElement("span");
+                info.className = "tm-info";
+                info.style.marginLeft = "10px";
+                info.style.whiteSpace = "nowrap";
+                info.style.fontWeight = "700";
+                info.style.fontSize = "inherit";
+                info.style.color = "inherit";
+
+                titulo.appendChild(info);
+            }
+
+            if (info.textContent !== texto) {
+                info.textContent = texto;
+            }
+
+        });
+    }
+
+    atualizar();
+
+    new MutationObserver(atualizar).observe(document.body, {
+        childList: true,
+        subtree: true
+    });
+
+    setInterval(atualizar, 1000);
+
+})();
