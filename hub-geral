@@ -1,11 +1,16 @@
 // ==UserScript==
 // @name         Painel de Scripts (Unificado)
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
-// @description  Painel central com botão + modal para ativar/desativar cada script individualmente, e agora com opção de adicionar novos scripts pela própria interface, sem recarregar a página
-// @author       Você
-// @match        *://*/*
+// @version      1.5.0
+// @description  Painel central
+// @author       Gilmario
+// @match        *://*.tallos.com.br/*
+// @match        *://*.smarttravelit.com/*
 // @grant        GM_setClipboard
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_addValueChangeListener
+// @grant        GM_removeValueChangeListener
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -16,12 +21,15 @@
     // ARMAZENAMENTO DO ESTADO (quais módulos estão ligados/desligados)
     // =========================================================================
     const STORAGE_KEY_STATE = 'tmm_painel_scripts_state_v1';
-    // Armazenamento dos scripts customizados adicionados pelo próprio painel
-    const STORAGE_KEY_CUSTOM = 'tmm_painel_scripts_custom_v1';
+
+    // Agora usamos GM_setValue/GM_getValue em vez de localStorage.
+    // Diferença importante: localStorage é isolado POR SITE (cada domínio tem o seu).
+    // GM_setValue/GM_getValue é isolado POR PERFIL DO NAVEGADOR (Tampermonkey guarda
+    // o valor uma única vez, e todos os sites onde o script roda enxergam o mesmo estado).
 
     function carregarEstado() {
         try {
-            const dados = JSON.parse(localStorage.getItem(STORAGE_KEY_STATE) || '{}');
+            const dados = JSON.parse(GM_getValue(STORAGE_KEY_STATE, '{}'));
             return (dados && typeof dados === 'object') ? dados : {};
         } catch {
             return {};
@@ -29,20 +37,35 @@
     }
 
     function salvarEstado(estado) {
-        localStorage.setItem(STORAGE_KEY_STATE, JSON.stringify(estado));
+        GM_setValue(STORAGE_KEY_STATE, JSON.stringify(estado));
     }
 
-    function carregarScriptsCustom() {
-        try {
-            const dados = JSON.parse(localStorage.getItem(STORAGE_KEY_CUSTOM) || '[]');
-            return Array.isArray(dados) ? dados : [];
-        } catch {
-            return [];
-        }
-    }
+    // Sincronização em tempo real: se o estado for alterado em outra aba/site,
+    // essa aba é avisada automaticamente e atualiza o painel + liga/desliga módulos.
+    if (typeof GM_addValueChangeListener === 'function') {
+        GM_addValueChangeListener(STORAGE_KEY_STATE, (nome, valorAntigo, valorNovo, remoto) => {
+            if (!remoto) return; // ignora a própria mudança feita nesta aba
 
-    function salvarScriptsCustom(lista) {
-        localStorage.setItem(STORAGE_KEY_CUSTOM, JSON.stringify(lista));
+            let novoEstado;
+            try {
+                novoEstado = JSON.parse(valorNovo || '{}');
+            } catch {
+                novoEstado = {};
+            }
+
+            modulos.forEach(mod => {
+                const deveEstarLigado = (novoEstado[mod.id] !== undefined) ? novoEstado[mod.id] : mod.defaultOn;
+                if (deveEstarLigado && !mod._ativo) {
+                    ligarModulo(mod);
+                } else if (!deveEstarLigado && mod._ativo) {
+                    desligarModulo(mod);
+                }
+            });
+
+            if (typeof atualizarCheckboxesDoPainel === 'function') {
+                atualizarCheckboxesDoPainel();
+            }
+        });
     }
 
     // =========================================================================
@@ -52,12 +75,18 @@
     // init()    -> liga o script (cria elementos, observers, intervals etc.)
     // destroy() -> desliga o script (remove tudo que o init() criou)
     const modulos = [];
+    let atualizarCheckboxesDoPainel = null;
 
-    function registrarModulo(mod) {
-        mod._ativo = false;
-        modulos.push(mod);
-    }
+function registrarModulo(mod) {
+    mod._ativo = false;
+    modulos.push(mod);
 
+    modulos.sort((a, b) =>
+        a.name.localeCompare(b.name, "pt-BR", {
+            sensitivity: "base"
+        })
+    );
+}
     function removerModuloDoRegistro(id) {
         const idx = modulos.findIndex(m => m.id === id);
         if (idx !== -1) modulos.splice(idx, 1);
@@ -185,7 +214,7 @@
 
         return {
             id: 'desconto',
-            name: 'Botão Aplicar Desconto Dinâmico',
+            name: 'SMART BUS - Botão Aplicar Desconto Dinâmico',
             defaultOn: true,
             fixo: true, // módulo embutido no código-fonte, não pode ser excluído pelo painel
 
@@ -223,6 +252,18 @@
 
         const TEMPO_LIMITE_MS = CONFIG.TEMPO_LIMITE_MINUTOS * 60 * 1000;
 
+        // Lista de termos de interface a ignorar na busca por nome de cliente.
+        // Antes era recriada a cada elemento candidato dentro do loop; agora existe
+        // uma única vez por módulo.
+        const TERMOS_IGNORAR_NOME = [
+            'DASHBOARD', 'CONTATOS', 'RELATÓRIOS', 'CONFIGURAÇÕES', 'MENSAGENS',
+            'SETOR', 'SETORES', 'CANAIS', 'MEUS ATENDIMENTOS', 'MAIS RECENTE',
+            'BUSCAR', 'TRANSFERIR', 'ENCERRAR', 'PERFIL', 'ETIQUETAS', 'ATIVIDADES',
+            'FUNIL', 'FUNIS', 'CARTEIRAS', 'HISTÓRICO', 'BUSCAR POR CONTATO',
+            'INÍCIO', 'CHAT', 'AUTOMAÇÃO', 'ANALISAR', 'INVISÍVEL',
+            'OPERADORES', 'FILA DE ESPERA', 'CHATBOT', 'TODOS', 'NÃO LIDAS'
+        ];
+
         let quantidadeAtrasadosAnterior = 0;
         let styleEl = null;
         let wrapperUI = null;
@@ -238,22 +279,30 @@
         function varrerFilaLateral() {
             const todosElementos = document.querySelectorAll('*');
             const horariosEncontrados = [];
+            // Pré-filtra, numa única passagem pelo DOM, os elementos que podem ser
+            // "nome de cliente" (mesma faixa de posição usada depois). Antes, para
+            // CADA horário encontrado, o código reescaneava todos os elementos da
+            // página de novo (O(n²)) — agora esse conjunto é calculado uma vez só
+            // e reaproveitado para todos os horários da mesma varredura.
+            const candidatosNome = [];
             const clientesAtrasados = [];
             const agora = Date.now();
 
             for (let el of todosElementos) {
-                if (el.children.length === 0 && el.offsetParent) {
-                    const rect = el.getBoundingClientRect();
+                if (el.children.length !== 0 || !el.offsetParent) continue;
 
-                    if (rect.left >= 230 && rect.left < 400 && rect.top > 80 && rect.width > 0) {
-                        const txt = el.textContent.trim();
-                        if (txt.length > 10) continue;
-                        const match = txt.match(/^([0-2]?[0-9]):([0-5][0-9])\s*(AM|PM)?$/i);
+                const rect = el.getBoundingClientRect();
 
-                        if (match) {
-                            horariosEncontrados.push({ el, txt, match, rect });
-                        }
+                if (rect.left >= 230 && rect.left < 400 && rect.top > 80 && rect.width > 0) {
+                    const txt = el.textContent.trim();
+                    if (txt.length > 10) continue;
+                    const match = txt.match(/^([0-2]?[0-9]):([0-5][0-9])\s*(AM|PM)?$/i);
+
+                    if (match) {
+                        horariosEncontrados.push({ el, txt, match, rect });
                     }
+                } else if (rect.left > 75 && rect.left < 260) {
+                    candidatosNome.push({ el, rect, txt: el.textContent.trim() });
                 }
             }
 
@@ -281,31 +330,22 @@
                     let elementoFisicoOriginal = null;
                     let menorDistanciaX = 999;
 
-                    for (let elNome of todosElementos) {
-                        if (elNome === item.el || elNome.children.length > 0 || !elNome.offsetParent) continue;
-                        const rectNome = elNome.getBoundingClientRect();
+                    for (let cand of candidatosNome) {
+                        if (cand.el === item.el) continue;
+                        if (Math.abs(cand.rect.top - item.rect.top) >= 25) continue;
 
-                        if (rectNome.left > 75 && rectNome.left < 260 && Math.abs(rectNome.top - item.rect.top) < 25) {
-                            const txtNome = elNome.textContent.trim();
-                            const txtNomeUpper = txtNome.toUpperCase();
+                        const txtNome = cand.txt;
+                        const txtNomeUpper = txtNome.toUpperCase();
 
-                            const ignorar = [
-                                'DASHBOARD', 'CONTATOS', 'RELATÓRIOS', 'CONFIGURAÇÕES', 'MENSAGENS',
-                                'SETOR', 'SETORES', 'CANAIS', 'MEUS ATENDIMENTOS', 'MAIS RECENTE',
-                                'BUSCAR', 'TRANSFERIR', 'ENCERRAR', 'PERFIL', 'ETIQUETAS', 'ATIVIDADES',
-                                'FUNIL', 'FUNIS', 'CARTEIRAS', 'HISTÓRICO', 'BUSCAR POR CONTATO',
-                                'INÍCIO', 'CHAT', 'AUTOMAÇÃO', 'ANALISAR', 'INVISÍVEL',
-                                'OPERADORES', 'FILA DE ESPERA', 'CHATBOT', 'TODOS', 'NÃO LIDAS'
-                            ];
+                        const isTermoProibido = TERMOS_IGNORAR_NOME.some(
+                            termo => txtNomeUpper === termo || txtNomeUpper.includes(termo)
+                        );
 
-                            const isTermoProibido = ignorar.some(termo => txtNomeUpper === termo || txtNomeUpper.includes(termo));
-
-                            if (txtNome.length > 2 && !txtNome.match(/\d{2}:\d{2}/) && !isTermoProibido) {
-                                if (rectNome.left < menorDistanciaX) {
-                                    menorDistanciaX = rectNome.left;
-                                    nomeDoCliente = txtNome;
-                                    elementoFisicoOriginal = elNome;
-                                }
+                        if (txtNome.length > 2 && !txtNome.match(/\d{2}:\d{2}/) && !isTermoProibido) {
+                            if (cand.rect.left < menorDistanciaX) {
+                                menorDistanciaX = cand.rect.left;
+                                nomeDoCliente = txtNome;
+                                elementoFisicoOriginal = cand.el;
                             }
                         }
                     }
@@ -364,7 +404,7 @@
 
         return {
             id: 'tallos_30min',
-            name: '30 min — Alerta de Atraso na Fila (Tallos)',
+            name: 'TALLOS - Alerta de 30 min',
             defaultOn: true,
             fixo: true, // módulo embutido no código-fonte, não pode ser excluído pelo painel
 
@@ -379,7 +419,7 @@
                         position: fixed;
                         right: 464px;
                         top: 8px;
-                        z-index: 999999;
+                        z-index: 1;
                         font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
                     }
 
@@ -639,10 +679,14 @@
         let handleMouseMove = null;
         let handleMouseUp = null;
         let handleResize = null;
+        let changeListenerId = null;
 
+        // Agora usa GM_setValue/GM_getValue em vez de localStorage: os alarmes deixam
+        // de ficar presos por domínio e passam a sincronizar entre SmartBus e Tallos,
+        // igual ao estado dos módulos do painel master.
         function loadAlarms() {
             try {
-                const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+                const parsed = JSON.parse(GM_getValue(STORAGE_KEY, '[]'));
                 return Array.isArray(parsed) ? parsed : [];
             } catch {
                 return [];
@@ -650,7 +694,7 @@
         }
 
         function saveAlarms() {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(alarms));
+            GM_setValue(STORAGE_KEY, JSON.stringify(alarms));
         }
 
         function normalizeLoadedAlarms() {
@@ -699,9 +743,9 @@
                 #tm-alarm-root {
                     --tm-cream: #1c1a1e;
                     --tm-surface: #232025;
-                    --tm-peach: #ff9c5c;
-                    --tm-peach-strong: #ff6a1f;
-                    --tm-peach-line: rgba(255, 106, 31, 0.4);
+                    --tm-peach: #60a5fa;
+                    --tm-peach-strong: #3b82f6;
+                    --tm-peach-line: rgba(59, 130, 246, 0.4);
                     --tm-ink: #f3ece6;
                     --tm-ink-soft: #a89d94;
                     --tm-mint: #7ed9ab;
@@ -715,7 +759,7 @@
                     position: fixed;
                     right: 410px;
                     top: 8px;
-                    z-index: 2147483647;
+                    z-index: 1;
                     width: 45px;
                     height: 45px;
                     display: flex;
@@ -724,8 +768,8 @@
                     border-radius: 50%;
                     border: none;
                     cursor: pointer;
-                    background: linear-gradient(150deg, #ff8a3d, var(--tm-peach-strong));
-                    color: #1c1a1e;
+                    background: linear-gradient(150deg, #60a5fa, var(--tm-peach-strong));
+                    color: #0f172a;
                 }
 
                 #tm-alarm-fab:hover {
@@ -864,8 +908,8 @@
                     font-size: 13.5px;
                     font-weight: 700;
                     font-family: 'Sora', Arial, sans-serif;
-                    background: linear-gradient(135deg, #ff8a3d, var(--tm-peach-strong));
-                    color: #1c1a1e;
+                    background: linear-gradient(135deg, #60a5fa, var(--tm-peach-strong));
+                    color: #ffffff;
                     margin: 4px 0 4px;
                 }
 
@@ -880,21 +924,36 @@
                     pointer-events: none;
                 }
 
-                .tm-floating-alarm {
-                    position: fixed;
-                    width: 188px;
-                    border-radius: 20px;
-                    background: linear-gradient(90deg, #1c1a1e 0%, #1c1a1e 20%, var(--tm-peach-strong) 100%);
-                    border: 1px solid var(--tm-peach-line);
-                    display: flex;
-                    align-items: center;
-                    gap: 10px;
-                    padding: 8px 10px;
-                    pointer-events: auto;
-                    user-select: none;
-                    cursor: grab;
-                    animation: tm-pop-in .22s cubic-bezier(.2, .9, .3, 1.2);
-                }
+
+.tm-floating-alarm {
+    position: fixed;
+    width: 188px;
+
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    border-radius: 18px;
+    background: linear-gradient(
+        135deg,
+        #171717 0%,
+        #242424 30%,
+        #2563eb 100%
+    );
+    border: 1px solid #1d4ed8;
+    color: #ffffff;
+    pointer-events: auto;
+    user-select: none;
+    cursor: grab;
+}
+
+.tm-floating-alarm:hover{
+    border-color:#3b82f6;
+}
+
+.tm-floating-alarm:hover{
+    border-color:#ff9a45;
+}
 
                 .tm-floating-alarm.tm-dragging {
                     cursor: grabbing;
@@ -1330,7 +1389,7 @@
 
         return {
             id: 'alarme_flutuante',
-            name: 'Alarme — Cartões Flutuantes com Cronômetro',
+            name: 'TALLOS - Alarme de poltronas',
             defaultOn: true,
             fixo: true, // módulo embutido no código-fonte, não pode ser excluído pelo painel
 
@@ -1347,6 +1406,24 @@
                 createUI();
                 normalizeLoadedAlarms();
                 renderFloatingAlarmBalloons();
+
+                // Sincroniza os alarmes em tempo real entre abas/domínios (SmartBus <-> Tallos),
+                // igual ao estado dos módulos do painel master.
+                if (typeof GM_addValueChangeListener === 'function') {
+                    changeListenerId = GM_addValueChangeListener(STORAGE_KEY, (nome, valorAntigo, valorNovo, remoto) => {
+                        if (!remoto) return; // ignora a própria mudança feita nesta aba/domínio
+
+                        try {
+                            alarms = JSON.parse(valorNovo || '[]');
+                        } catch {
+                            alarms = [];
+                        }
+
+                        normalizeLoadedAlarms();
+                        renderFloatingAlarmBalloons();
+                        updateFabDot();
+                    });
+                }
 
                 handleMouseMove = (e) => {
                     if (!dragState) return;
@@ -1399,6 +1476,11 @@
                 if (handleMouseUp) document.removeEventListener('mouseup', handleMouseUp);
                 handleMouseUp = null;
 
+                if (changeListenerId !== null && typeof GM_removeValueChangeListener === 'function') {
+                    GM_removeValueChangeListener(changeListenerId);
+                    changeListenerId = null;
+                }
+
                 rootEl?.remove();
                 styleEl?.remove();
                 rootEl = null;
@@ -1411,59 +1493,3103 @@
     registrarModulo(criarModuloAlarme());
 
     // =========================================================================
-    // MÓDULOS CUSTOMIZADOS — adicionados pelo próprio usuário via painel
+    // MÓDULO 4 — Colar Trecho Automático (copiar trecho / preencher formulário)
     // =========================================================================
-    // Cada item salvo tem o formato: { id, name, code, ativarAuto }
-    // "code" é um texto JS que, ao ser avaliado, deve resultar em um objeto
-    // com os métodos init() e destroy(), exatamente como os módulos fixos.
-    //
-    // Exemplo do que a pessoa cola na caixa de código:
-    //
-    // {
-    //     init() {
-    //         console.log('meu script ligou');
-    //     },
-    //     destroy() {
-    //         console.log('meu script desligou');
-    //     }
-    // }
+    function criarModuloColarTrecho() {
+        let observerCriacao = null;
 
-    function criarModuloCustom(item) {
-        let instancia = null;
+        function criarBotaoCopiar() {
+            const div = document.querySelectorAll('.card-coupon-area')[0];
+
+            if (!div) {
+                // Se ainda não existe, tenta de novo em breve (útil em sites com carregamento dinâmico)
+                return false;
+            }
+
+            // Evita adicionar o botão mais de uma vez
+            if (div.querySelector('.tm-copiar-btn')) {
+                return true;
+            }
+
+            const botao = document.createElement('button');
+            botao.textContent = 'Copiar Trecho';
+            botao.className = 'tm-copiar-btn';
+            botao.style.cssText = `
+                margin-top: 35px;
+                padding: 10px 14px;
+                background: darkgreen;
+                color: #fff;
+                border: none;
+                border-radius: 8px;
+                cursor: pointer;
+                font-size: 13px;
+                font-weight: bold;
+                box-shadow: 0 6px 16px rgba(16, 185, 129, 0.35);
+                transition: transform 0.15s ease, box-shadow 0.15s ease;
+                z-index: 9999;
+            `;
+            botao.addEventListener('mouseenter', () => {
+                botao.style.transform = 'translateY(-1px)';
+                botao.style.boxShadow = '0 8px 20px rgba(16, 185, 129, 0.45)';
+            });
+            botao.addEventListener('mouseleave', () => {
+                botao.style.transform = 'none';
+                botao.style.boxShadow = '0 6px 16px rgba(16, 185, 129, 0.35)';
+            });
+
+            botao.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+
+                const textoBruto = div.innerText;
+                const dados = formatarTrechos(textoBruto);
+
+                // Copia para a área de transferência
+                if (typeof GM_setClipboard !== 'undefined') {
+                    GM_setClipboard(dados, 'text');
+                } else {
+                    navigator.clipboard.writeText(dados);
+                }
+
+                const textoOriginal = botao.textContent;
+                botao.textContent = 'Copiado!';
+                setTimeout(() => {
+                    botao.textContent = textoOriginal;
+                }, 1500);
+            });
+
+            // Siglas válidas de UF brasileiras, usadas para achar com segurança o ponto onde a UF
+            // da origem termina e a próxima cidade começa (quando estão coladas sem espaço).
+            const UFS = ['AC','AL','AP','AM','BA','CE','DF','ES','GO','MA','MT','MS','MG','PA','PB',
+                'PR','PE','PI','RJ','RN','RS','RO','RR','SC','SP','SE','TO'];
+            const UF_ALT = UFS.join('|');
+
+            // Acha o ponto de corte entre origem e destino dentro de uma linha "Trecho ..." em que
+            // os dois nomes vêm colados, sem separador (ex: "...- CESOBRAL - CE" ou
+            // "...Olímpica)BELO HORIZONTE - MG"). Existem dois padrões possíveis de colagem:
+            //  1) UF válida colada direto na cidade seguinte, ex: "- CE" + "SOBRAL"
+            //  2) Parênteses fechando colado direto na cidade seguinte, ex: "Olímpica)" + "BELO"
+            // Usa o que aparecer primeiro no texto (nem toda origem tem UF própria, como no caso
+            // de "Rio de Janeiro (RIO2 - Barra Olímpica)", que não tem "- UF" antes do destino).
+            function dividirOrigemDestino(texto) {
+                const regexUFGrudada = new RegExp(`\\s-\\s(?:${UF_ALT})(?=[A-Za-zÀ-ÿ])`);
+                const matchUF = texto.match(regexUFGrudada);
+
+                const regexParenGrudado = /\)(?=[A-ZÀ-Ü])/;
+                const matchParen = texto.match(regexParenGrudado);
+
+                const corteUF = matchUF ? matchUF.index + matchUF[0].length : -1;
+                const corteParen = matchParen ? matchParen.index + 1 : -1;
+
+                let corte = -1;
+                if (corteUF !== -1 && corteParen !== -1) {
+                    corte = Math.min(corteUF, corteParen);
+                } else if (corteUF !== -1) {
+                    corte = corteUF;
+                } else if (corteParen !== -1) {
+                    corte = corteParen;
+                }
+
+                if (corte === -1) return null;
+
+                return {
+                    origemTexto: texto.slice(0, corte).trim(),
+                    destinoTexto: texto.slice(corte).trim()
+                };
+            }
+
+            // Normaliza um texto de local para comparação (maiúsculas, sem espaços duplicados)
+            function normalizarLocal(texto) {
+                return String(texto || '').trim().toUpperCase().replace(/\s+/g, ' ');
+            }
+
+            // Extrai os trechos (origem/destino) e as datas de IDA/VOLTA do texto bruto
+            function formatarTrechos(texto) {
+                const linhas = texto.split('\n').map(l => l.trim()).filter(Boolean);
+
+                const blocos = [];
+                let atual = null;
+
+                linhas.forEach(linha => {
+                    if (linha.startsWith('Trecho ')) {
+                        if (atual) blocos.push(atual);
+                        // Remove o prefixo "Trecho " para não atrapalhar a divisão origem/destino
+                        atual = { linha: linha.replace(/^Trecho\s+/, '').trim(), data: null };
+                    } else if (atual && !atual.data && /^\d{2}\/\d{2}\/\d{4}$/.test(linha)) {
+                        atual.data = linha;
+                    }
+                });
+                if (atual) blocos.push(atual);
+
+                const trechos = blocos.map(bloco => {
+                    const divisao = dividirOrigemDestino(bloco.linha);
+                    if (!divisao) return null;
+                    return { origem: divisao.origemTexto, destino: divisao.destinoTexto, data: bloco.data };
+                }).filter(t => t && t.origem && t.destino);
+
+                if (trechos.length === 0) {
+                    return texto.trim(); // fallback: se não conseguir identificar, copia o texto bruto
+                }
+
+                const primeiro = trechos[0];
+                const ultimo = trechos[trechos.length - 1];
+
+                // É ida e volta de verdade só se o destino do último trecho voltar pra origem do
+                // primeiro (fecha o ciclo). Se não fechar, é uma conexão: junta origem do 1º com
+                // destino do último e usa só a data de IDA.
+                const ehIdaEVolta = trechos.length === 2 &&
+                    normalizarLocal(ultimo.destino) === normalizarLocal(primeiro.origem);
+
+                let resultado;
+
+                if (ehIdaEVolta) {
+                    resultado = `TRECHO: ${primeiro.origem} para ${primeiro.destino}\n\n`;
+                    resultado += `IDA: ${primeiro.data || '-'}`;
+                    resultado += `\nVOLTA: ${trechos[1].data || '-'}`;
+                } else {
+                    resultado = `TRECHO: ${primeiro.origem} para ${ultimo.destino}\n\n`;
+                    resultado += `IDA: ${primeiro.data || '-'}`;
+                }
+
+                return resultado;
+            }
+
+            div.appendChild(botao);
+            return true;
+        }
+
+        function criarTextareaEBotaoPreencher() {
+            const div = document.querySelectorAll('.col-button-only')[2];
+
+            if (!div) {
+                return false;
+            }
+
+            if (div.querySelector('.tm-preencher-area')) {
+                return true;
+            }
+
+            const wrapper = document.createElement('div');
+            wrapper.className = 'tm-preencher-area';
+            wrapper.style.cssText = `
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                margin-top: 8px;
+                padding: 10px;
+                background: #1c1a1e;
+                border: 1px solid #322f36;
+                border-radius: 12px;
+            `;
+
+            const textarea = document.createElement('textarea');
+            textarea.placeholder = 'Cole aqui:';
+            textarea.style.cssText = `
+                width: 100%;
+                min-height: 80px;
+                padding: 8px;
+                font-size: 13px;
+                box-sizing: border-box;
+                background: #162033;
+                color: #e2e8f0;
+                border: 1px solid #3a3640;
+                border-radius: 8px;
+                outline: none;
+                resize: vertical;
+                font-family: inherit;
+            `;
+            textarea.addEventListener('focus', () => {
+                textarea.style.borderColor = '#3b82f6';
+            });
+            textarea.addEventListener('blur', () => {
+                textarea.style.borderColor = '#3a3640';
+            });
+
+            const botaoPreencher = document.createElement('button');
+            botaoPreencher.textContent = 'Preencher';
+            botaoPreencher.style.cssText = `
+                padding: 8px 14px;
+                background: linear-gradient(135deg, #60a5fa, #2563eb);
+                color: #ffffff;
+                border: none;
+                border-radius: 8px;
+                cursor: pointer;
+                font-size: 13px;
+                font-weight: bold;
+            `;
+            botaoPreencher.addEventListener('mouseenter', () => {
+                botaoPreencher.style.transform = 'translateY(-1px)';
+            });
+            botaoPreencher.addEventListener('mouseleave', () => {
+                botaoPreencher.style.transform = 'none';
+            });
+
+            botaoPreencher.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+
+                const info = extrairOrigemDestino(textarea.value);
+                const datas = extrairDatas(textarea.value);
+
+                if (!info) {
+                    alert('Não foi possível identificar origem/destino no texto colado.');
+                    return;
+                }
+
+                preencherTudo(info, datas);
+            });
+
+            wrapper.appendChild(textarea);
+            wrapper.appendChild(botaoPreencher);
+            div.appendChild(wrapper);
+            return true;
+        }
+
+        // Extrai origem (com UF) e destino (só cidade) do texto "TRECHO: NATAL - RN para FORTALEZA"
+        function extrairOrigemDestino(texto) {
+            const match = texto.match(/TRECHO:\s*(.+?)\s+para\s+(.+)/i);
+            if (!match) return null;
+            return {
+                origem: match[1].trim(),
+                destino: match[2].trim()
+            };
+        }
+
+        // Extrai as datas "IDA: dd/mm/aaaa" e "VOLTA: dd/mm/aaaa" (volta é opcional)
+        function extrairDatas(texto) {
+            const idaMatch = texto.match(/IDA:\s*(\d{2}\/\d{2}\/\d{4})/i);
+            const voltaMatch = texto.match(/VOLTA:\s*(\d{2}\/\d{2}\/\d{4})/i);
+            return {
+                ida: idaMatch ? idaMatch[1].trim() : null,
+                volta: voltaMatch ? voltaMatch[1].trim() : null
+            };
+        }
+
+        // Fluxo completo: preenche origem -> destino -> data de ida -> data de volta (se tiver)
+        function preencherTudo(info, datas) {
+            const origem = separarCidadeUF(info.origem);
+            const destino = separarCidadeUF(info.destino);
+
+            abrirEPreencherSelect2(5, origem.cidade, origem.uf, (sucessoOrigem) => {
+                // Antes o código seguia para o Destino mesmo se a Origem falhasse (o parâmetro
+                // de sucesso era ignorado), o que deixava a Origem vazia sem avisar direito --
+                // dava a falsa impressão de que só "sumiu" um campo. Agora, se a Origem falhar,
+                // paramos aqui (o alerta de "não encontrei a cidade" já foi mostrado).
+                if (sucessoOrigem === false) {
+                    console.warn('[Tampermonkey] Preenchimento interrompido: falha ao selecionar a Origem.');
+                    return;
+                }
+
+                setTimeout(() => {
+                    abrirEPreencherSelect2(6, destino.cidade, destino.uf, (sucessoDestino) => {
+                        if (sucessoDestino === false) {
+                            console.warn('[Tampermonkey] Preenchimento interrompido: falha ao selecionar o Destino.');
+                            return;
+                        }
+
+                        setTimeout(() => {
+                            if (datas.ida) {
+                                preencherData(14, datas.ida);
+                            }
+                            if (datas.volta) {
+                                preencherData(16, datas.volta);
+                            }
+                        }, 80);
+                    });
+                }, 80);
+            });
+        }
+
+        // Separa "CIDADE (COMPLEMENTO) - UF" em { cidade, uf }.
+        // IMPORTANTE: o complemento entre parênteses é MANTIDO em `cidade` de propósito —
+        // é ele que diferencia terminais como "FORTALEZA (TA ANTONIO BEZERRA)" do terminal
+        // padrão "FORTALEZA". Removê-lo faz o select2 sempre cair na opção canônica.
+        function separarCidadeUF(texto) {
+            const match = texto.trim().match(/^(.*)\s-\s([A-Z]{2})$/);
+
+            if (match) {
+                return { cidade: match[1].trim().toUpperCase(), uf: match[2] };
+            }
+
+            return { cidade: texto.trim().toUpperCase(), uf: null };
+        }
+
+        // Preenche um campo de data (.ng-valid pelo índice) e dispara os eventos que o Angular escuta
+        function preencherData(indice, dataStr) {
+            const campos = document.querySelectorAll('.ng-valid');
+            const campo = campos[indice];
+
+            if (!campo) {
+                console.warn('[Tampermonkey] .ng-valid índice', indice, 'não encontrado para a data', dataStr);
+                alert(`Campo de data (índice ${indice}) não encontrado para "${dataStr}".`);
+                return false;
+            }
+
+            campo.focus();
+            campo.value = dataStr;
+
+            // Dispara os eventos que o Angular/datepicker escutam para reconhecer o valor digitado
+            campo.dispatchEvent(new Event('input', { bubbles: true }));
+            campo.dispatchEvent(new Event('change', { bubbles: true }));
+            campo.blur();
+
+            return true;
+        }
+
+        // Clica no .select2-selection do índice informado para abrir o dropdown
+        //
+        // IMPORTANTE: o Select2 abre/fecha o dropdown ouvindo o evento "mousedown" no
+        // elemento .select2-selection (assim ele evita fechar o próprio dropdown por causa
+        // do listener de "clique fora" que ouve mousedown no documento).
+        // Antes, disparávamos "mousedown" e, na sequência, chamávamos elem.click() -- isso
+        // fazia o dropdown alternar de estado DUAS vezes (abre no mousedown, fecha de novo
+        // no click), de forma intermitente conforme a velocidade de processamento do
+        // navegador. Era esse o motivo do preenchimento "sumir"/desfazer às vezes.
+        // Agora disparamos só o mousedown; se por algum motivo o dropdown não abrir, o
+        // fallback fica em aguardarCampoBusca(), que tenta um clique real uma única vez.
+        function abrirSelect2(indice) {
+            const elems = document.querySelectorAll('.select2-selection');
+            const elem = elems[indice];
+
+            if (!elem) {
+                console.warn('[Tampermonkey] .select2-selection índice', indice, 'não encontrado');
+                return null;
+            }
+
+            elem.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+            return elem;
+        }
+
+        // Abre o select do índice indicado, digita a cidade (com complemento, se houver) e seleciona
+        // a opção correspondente
+        function abrirEPreencherSelect2(indice, nomeCidade, uf, callback) {
+            const elem = abrirSelect2(indice);
+
+            if (!elem) {
+                alert(`Select de índice ${indice} não encontrado na página.`);
+                return;
+            }
+
+            aguardarCampoBusca(nomeCidade, uf, callback, 30, elem);
+        }
+
+        // Espera o campo .select2-search__field aparecer (dropdown abrir), digita e dispara os eventos.
+        // Digitamos o nome COMPLETO (incluindo o complemento entre parênteses, se houver), pois é assim
+        // que o campo de busca filtra corretamente para um terminal específico (ex: "FORTALEZA (TA
+        // ANTONIO BEZERRA)"), igual ao comportamento manual.
+        function aguardarCampoBusca(nomeCidade, uf, callback, tentativas = 30, elem = null) {
+            const campos = document.querySelectorAll('.select2-search__field');
+            const campo = Array.from(campos).find(c => c.offsetParent !== null);
+
+            if (campo) {
+                campo.focus();
+                campo.value = nomeCidade;
+                campo.dispatchEvent(new Event('input', { bubbles: true }));
+                campo.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+                aguardarESelecionarOpcao(nomeCidade, uf, callback);
+                return;
+            }
+
+            // Fallback: se na metade das tentativas o dropdown ainda não abriu com o mousedown
+            // sozinho, tenta UM clique real (não repetido) como segunda via.
+            if (elem && tentativas === 15) {
+                elem.click();
+            }
+
+            if (tentativas <= 0) {
+                console.warn('[Tampermonkey] Campo de busca não apareceu para', nomeCidade);
+                alert(`O campo de busca do select não abriu para "${nomeCidade}".`);
+                return;
+            }
+
+            setTimeout(() => aguardarCampoBusca(nomeCidade, uf, callback, tentativas - 1, elem), 50);
+        }
+
+        // Tenta encontrar a opção com o nome da cidade na lista renderizada pelo select2.
+        // Como a filtragem é assíncrona (geralmente busca no servidor conforme digita), tenta
+        // várias vezes com um pequeno intervalo. Em máquinas/conexões mais lentas essa busca
+        // pode demorar bem mais que em outras -- por isso o número de tentativas é generoso
+        // (80 tentativas x 100ms = até 8s). Como sai assim que encontra a opção, isso não
+        // deixa o preenchimento mais lento em máquinas rápidas.
+        function aguardarESelecionarOpcao(nomeCidade, uf, callback, tentativas = 80) {
+            const opcoes = Array.from(document.querySelectorAll('.select2-results__option'))
+                .filter(op => !op.classList.contains('select2-results__message'));
+
+            const opcao = encontrarOpcao(opcoes, nomeCidade, uf);
+
+            if (opcao) {
+                // Simula os eventos de mouse que o select2 escuta para confirmar a seleção
+                ['mouseenter', 'mousedown', 'mouseup', 'click'].forEach(tipo => {
+                    opcao.dispatchEvent(new MouseEvent(tipo, { bubbles: true, cancelable: true }));
+                });
+                if (callback) setTimeout(() => callback(true), 50);
+                return;
+            }
+
+            if (tentativas <= 0) {
+                console.warn('[Tampermonkey] Nenhuma opção encontrada para a cidade:', nomeCidade);
+                alert(`Não encontrei "${nomeCidade}" na lista de opções do select.`);
+                if (callback) callback(false);
+                return;
+            }
+
+            setTimeout(() => aguardarESelecionarOpcao(nomeCidade, uf, callback, tentativas - 1), 100);
+        }
+
+        // Compara pelo nome exato da cidade, extraído de forma robusta do texto da opção.
+        // Formatos possíveis: "CÓD - CIDADE - UF" ou "CÓD - CIDADE (COMPLEMENTO) - UF"
+        //
+        // Estratégia:
+        // 1) Se `nomeCidade` já tem um complemento entre parênteses (ex: "FORTALEZA (TA ANTONIO
+        //    BEZERRA)"), tenta achar a opção cujo nome COMPLETO (cidade + complemento) bate
+        //    exatamente. Isso resolve o caso de terminais alternativos.
+        // 2) Se não tiver complemento, cai no comportamento anterior: compara só pela cidade (sem
+        //    parênteses) e, se houver ambiguidade, prefere a opção canônica (sem complemento) ou
+        //    desempata pela UF.
+        function encontrarOpcao(opcoes, nomeCidade, uf) {
+            if (nomeCidade.includes('(')) {
+                const exatoComComplemento = opcoes.find(
+                    op => extrairCidadeCompletaDaOpcao(op.textContent) === nomeCidade
+                );
+                if (exatoComComplemento) {
+                    return exatoComComplemento;
+                }
+                // Se não achou o complemento exato, continua para o fallback abaixo
+                // comparando apenas pela cidade (sem o complemento).
+            }
+
+            const nomeSemComplemento = nomeCidade.replace(/\s*\([^)]*\)\s*/g, ' ').trim();
+
+            const candidatosExatos = opcoes.filter(op => extrairCidadeDaOpcao(op.textContent) === nomeSemComplemento);
+
+            if (candidatosExatos.length === 1) {
+                return candidatosExatos[0];
+            }
+
+            if (candidatosExatos.length > 1) {
+                const semParenteses = candidatosExatos.filter(op => !op.textContent.includes('('));
+
+                if (semParenteses.length === 1) {
+                    return semParenteses[0];
+                }
+
+                if (uf) {
+                    const porUF = (semParenteses.length > 0 ? semParenteses : candidatosExatos)
+                        .find(op => extrairUFDaOpcao(op.textContent) === uf);
+                    if (porUF) return porUF;
+                }
+
+                if (semParenteses.length > 0) {
+                    return semParenteses[0];
+                }
+
+                return candidatosExatos[0];
+            }
+
+            // fallback: se não achou nenhuma correspondência exata, tenta por "contém"
+            return opcoes.find(op => op.textContent.toUpperCase().includes(nomeSemComplemento));
+        }
+
+        // Extrai o nome da cidade do texto de uma opção do select2, SEM o complemento entre
+        // parênteses. Remove o "CÓDIGO - " do início, depois corta no primeiro "(" ou " - ".
+        function extrairCidadeDaOpcao(texto) {
+            const semCodigo = texto.trim().replace(/^.*?-\s*/, '');
+            const match = semCodigo.match(/^(.*?)(?:\s\(|\s-\s|$)/);
+            return (match ? match[1] : semCodigo).trim().toUpperCase();
+        }
+
+        // Extrai o nome da cidade COM o complemento entre parênteses (se existir), mas sem a UF
+        // e sem o código do terminal. Ex: "ABEZ - FORTALEZA (TA ANTONIO BEZERRA) - CE"
+        // -> "FORTALEZA (TA ANTONIO BEZERRA)"
+        function extrairCidadeCompletaDaOpcao(texto) {
+            const semCodigo = texto.trim().replace(/^.*?-\s*/, '');
+            const semUF = semCodigo.replace(/\s-\s[A-Z]{2}\s*$/, '');
+            return semUF.trim().toUpperCase();
+        }
+
+        // Extrai a UF do final do texto da opção, se existir (ex: "... - RJ" -> "RJ")
+        function extrairUFDaOpcao(texto) {
+            const match = texto.trim().match(/-\s*([A-Z]{2})\s*$/);
+            return match ? match[1] : null;
+        }
 
         return {
-            id: item.id,
-            name: item.name,
-            defaultOn: !!item.ativarAuto,
-            fixo: false,
-            custom: true,
+            id: 'colar_trecho_auto',
+            name: 'SMART BUS - Preencher Trecho',
+            defaultOn: true,
+            fixo: true, // módulo embutido no código-fonte, não pode ser excluído pelo painel
 
             init() {
-                const fabrica = new Function('"use strict"; return (' + item.code + ');');
-                instancia = fabrica();
+                const botaoOk = criarBotaoCopiar();
+                const textareaOk = criarTextareaEBotaoPreencher();
 
-                if (!instancia || typeof instancia.init !== 'function') {
-                    throw new Error('O código precisa retornar um objeto com um método init().');
+                if (!botaoOk || !textareaOk) {
+                    // Caso alguma div ainda não exista no carregamento, observa mudanças no DOM
+                    observerCriacao = new MutationObserver(() => {
+                        const a = criarBotaoCopiar();
+                        const b = criarTextareaEBotaoPreencher();
+                        if (a && b) {
+                            observerCriacao.disconnect();
+                            observerCriacao = null;
+                        }
+                    });
+                    observerCriacao.observe(document.body, { childList: true, subtree: true });
                 }
-                instancia.init();
             },
 
             destroy() {
-                if (instancia && typeof instancia.destroy === 'function') {
-                    instancia.destroy();
+                if (observerCriacao) {
+                    observerCriacao.disconnect();
+                    observerCriacao = null;
                 }
-                instancia = null;
+                document.querySelector('.tm-copiar-btn')?.remove();
+                document.querySelector('.tm-preencher-area')?.remove();
             }
         };
     }
 
-    function registrarTodosOsScriptsCustom() {
-        carregarScriptsCustom().forEach(item => {
-            registrarModulo(criarModuloCustom(item));
+    registrarModulo(criarModuloColarTrecho());
+
+    // =========================================================================
+    // MÓDULO 5 — Guanabara: Suporte Print dos Horários
+    // =========================================================================
+    function criarModuloGuanabara() {
+        const FONTE_PADRAO = "'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
+        const MAX_ITENS_POR_IMAGEM = 15;
+
+        const DICIONARIO_CIDADES = {
+            "THE": "TERESINA", "PHB": "PARNAÍBA", "FOR": "FORTALEZA", "SLZ": "SÃO LUÍS",
+            "PIC": "PICOS", "FLR": "FLORIANO", "SOB": "SOBRAL", "CJP": "CAJUEIRO DA PRAIA",
+            "LCR": "LUÍS CORREIA", "NAT": "NATAL", "REC": "RECIFE", "JPA": "JOÃO PESSOA",
+            "MCZ": "MACEIÓ", "AJU": "ARACAJU", "SSA": "SALVADOR", "BEL": "BELÉM",
+            "IMP": "IMPERATRIZ", "PNZ": "PETROLINA", "JDO": "JUAZEIRO DO NORTE",
+            "CMP": "CAMPO MAIOR", "PIR": "PIRIPIRI", "MOS": "MOSSORÓ", "TBA": "TIANGUÁ",
+            "CCM": "CAMOCIM", "CANGA": "RECIFE (CAXANGA)",
+            "VARG": "VARGEM GRANDE", "VGE": "VARGEM GRANDE", "GYN": "GOIÂNIA", "BSB": "BRASÍLIA",
+            "TJK": "BELO HORIZONTE (TERMINAL JK)", "RIO": "RIO DE JANEIRO", "BHZ": "BELO HORIZONTE",
+            "BCN": "BARBACENA", "BTI": "BETIM - MG (TERM ADICIONAL BH)"
+        };
+
+        let filaViagensGlobal = [];
+        let metadadosViagemGlobal = null;
+        let linkAtual = null;
+        let intervalHashId = null;
+        let intervalBotoesId = null;
+
+        // ---- Utilitários gerais e desenho ----
+        function formatarMoeda(valor) { return "R$ " + valor.toLocaleString('pt-BR', { minimumFractionDigits: 2 }); }
+
+        function extrairNumero(texto) {
+            if (!texto) return 0;
+            let limpo = texto.replace(/[^\d,]/g, '').replace(',', '.');
+            return parseFloat(limpo) || 0;
+        }
+
+        function desenharRetanguloArredondado(ctx, x, y, width, height, radius, fillStyle, strokeStyle = null) {
+            ctx.fillStyle = fillStyle;
+            ctx.beginPath();
+            ctx.moveTo(x + radius, y); ctx.lineTo(x + width - radius, y);
+            ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
+            ctx.lineTo(x + width, y + height - radius);
+            ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+            ctx.lineTo(x + radius, y + height);
+            ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
+            ctx.lineTo(x, y + radius); ctx.quadraticCurveTo(x, y, x + radius, y);
+            ctx.closePath();
+            ctx.fill();
+            if (strokeStyle) {
+                ctx.strokeStyle = strokeStyle;
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+            }
+        }
+
+        function limparCidade(nome) {
+            if (!nome) return "---";
+            let limpo = nome.replace(/\s*\(TERM[^\)]+\)/gi, '').replace(/^[A-Z]+\s*-\s*/i, '').replace(/\s*-\s*[A-Z]{2}(\s|$)/i, '').replace(/\s*\([A-Z]{2}\)/gi, '').trim();
+            let partes = limpo.split('(');
+            let base = partes[0].trim().toUpperCase();
+            let terminal = partes.length > 1 ? " (" + partes[1] : "";
+            if (DICIONARIO_CIDADES[base]) base = DICIONARIO_CIDADES[base];
+            return (base + terminal).trim();
+        }
+
+        // ---- Lógica da tabela de horários e imagem ----
+        function capturarTrecho() {
+            let origem = document.querySelector('#txt-origem')?.value || "";
+            let destino = document.querySelector('#txt-destino')?.value || "";
+            if (!origem || !destino) {
+                const textoTopo = document.body.innerText.substring(0, 1500);
+                const match = textoTopo.match(/de\s+(.*)\s+para\s+(.*?)(?:\n|em |$)/i);
+                if (match) { origem = match[1].trim(); destino = match[2].trim(); }
+            }
+
+            let isVolta = false;
+            let abasAtivas = document.querySelectorAll('.active, .current, .selected');
+            for (let i = 0; i < abasAtivas.length; i++) {
+                let txtAba = abasAtivas[i].innerText.toUpperCase();
+                if (txtAba.includes('VOLTA') && !txtAba.includes('IDA E VOLTA') && !txtAba.includes('IDA E RETORNO')) {
+                    isVolta = true; break;
+                }
+            }
+
+            if (document.body.innerText.toUpperCase().includes('ESCOLHA SUA VOLTA') ||
+                document.body.innerText.toUpperCase().includes('TRECHO DE VOLTA') ||
+                document.body.innerText.toUpperCase().includes('SELECIONE A VOLTA')) {
+                isVolta = true;
+            }
+
+            if (origem && destino) {
+                origem = limparCidade(origem);
+                destino = limparCidade(destino);
+
+                if (isVolta) return `${destino} ➔ ${origem}`.toUpperCase();
+                else return `${origem} ➔ ${destino}`.toUpperCase();
+            }
+            return "";
+        }
+
+        function desenharECopiarImagemTabela(dados) {
+            const btn = document.getElementById('btn-copy-william');
+
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            const largura = 850;
+            const margem = 30;
+            const alturaCartao = 100;
+            const espacoEntreCartoes = 15;
+
+            let temConexao = dados.viagens.some(v => v.isConexao);
+            let temDireta = dados.viagens.some(v => !v.isConexao);
+            let soConexao = temConexao && !temDireta;
+
+            let altura = 115;
+            altura += (dados.viagens.length * (alturaCartao + espacoEntreCartoes));
+            if (temConexao && temDireta) altura += 50;
+            if (soConexao) altura += 50;
+            altura += 30;
+
+            canvas.width = largura; canvas.height = altura;
+
+            ctx.fillStyle = '#F4F6F9';
+            ctx.fillRect(0, 0, largura, altura);
+
+            ctx.fillStyle = '#283593';
+            ctx.fillRect(0, 0, largura, 95);
+
+            let locOrigem = "ORIGEM", locDestino = "DESTINO";
+            if(dados.trecho) {
+                let pts = dados.trecho.split('➔');
+                if(pts.length === 2) {
+                    locOrigem = pts[0].trim(); locDestino = pts[1].trim();
+                } else if (dados.trecho.includes('->')) {
+                    pts = dados.trecho.split('->'); locOrigem = pts[0].trim(); locDestino = pts[1].trim();
+                } else {
+                    locOrigem = dados.trecho; locDestino = "";
+                }
+            }
+
+            let tituloTopo = "Passagem de ônibus";
+            if (locDestino !== "") {
+                tituloTopo += ` de ${locOrigem} para ${locDestino}`;
+            } else {
+                tituloTopo += ` ${locOrigem}`;
+            }
+
+            let extraAviso = (dados.temMaisRestantes || (!dados.temMaisRestantes && soConexao)) ? " (Continuação)" : "";
+            if(dados.isPrimeiroLote && !dados.temMaisRestantes) extraAviso = "";
+            if(dados.isPrimeiroLote && dados.temMaisRestantes) extraAviso = " (Parte 1)";
+            tituloTopo += extraAviso;
+
+            ctx.fillStyle = '#FFFFFF';
+            let fSize = 22;
+            let maxWidthTitulo = largura - (margem * 2);
+            ctx.font = `bold ${fSize}px ${FONTE_PADRAO}`;
+
+            while(ctx.measureText(tituloTopo).width > maxWidthTitulo && fSize > 14) {
+                fSize--;
+                ctx.font = `bold ${fSize}px ${FONTE_PADRAO}`;
+            }
+
+            if (ctx.measureText(tituloTopo).width > maxWidthTitulo) {
+                while (ctx.measureText(tituloTopo + "...").width > maxWidthTitulo && tituloTopo.length > 0) {
+                    tituloTopo = tituloTopo.slice(0, -1);
+                }
+                tituloTopo += "...";
+            }
+
+            ctx.fillText(tituloTopo, margem, 45);
+
+            ctx.fillStyle = '#FFC107';
+            ctx.font = `bold 16px ${FONTE_PADRAO}`;
+            ctx.fillText(`📅 ${dados.dataTexto}`, margem, 75);
+
+            let yAtual = 120;
+
+            let desenhouDivisor = false;
+
+            dados.viagens.forEach((v, index) => {
+                if (v.isConexao && !desenhouDivisor && (temDireta || index === 0)) {
+                    yAtual += 10;
+                    ctx.fillStyle = '#CBD5E1';
+                    ctx.fillRect(margem, yAtual, largura - (margem * 2), 1);
+                    ctx.fillStyle = '#64748B';
+                    ctx.font = `bold 12px ${FONTE_PADRAO}`;
+                    ctx.textAlign = 'center';
+                    ctx.fillText("🔄 OPÇÕES COM TROCA DE VEÍCULO OU MÚLTIPLAS PARADAS", largura / 2, yAtual + 22);
+                    ctx.textAlign = 'left';
+                    yAtual += 40;
+                    desenhouDivisor = true;
+                }
+
+                ctx.shadowColor = 'rgba(0,0,0,0.04)'; ctx.shadowBlur = 6; ctx.shadowOffsetY = 3;
+                desenharRetanguloArredondado(ctx, margem, yAtual, largura - (margem * 2), alturaCartao, 8, '#FFFFFF', '#CBD5E1');
+                ctx.shadowColor = 'transparent';
+
+                ctx.font = `bold 12px ${FONTE_PADRAO}`;
+                let servicoText = v.servico;
+                let pillWidth = ctx.measureText(servicoText).width + 24;
+                desenharRetanguloArredondado(ctx, margem + 25, yAtual + 23, pillWidth, 24, 12, '#EEF2FF', '#A5B4FC');
+                ctx.fillStyle = '#1E3A8A';
+                ctx.textAlign = 'center';
+                ctx.fillText(servicoText, margem + 25 + (pillWidth/2), yAtual + 40);
+
+                ctx.textAlign = 'left';
+                ctx.fillStyle = '#475569';
+                ctx.font = `600 13px ${FONTE_PADRAO}`;
+                ctx.fillText(`💺 ${v.textoPoltronas}`, margem + 30, yAtual + 75);
+
+                let centerCard = largura / 2;
+
+                ctx.fillStyle = '#0F172A';
+                ctx.font = `bold 24px ${FONTE_PADRAO}`;
+                ctx.textAlign = 'center';
+                ctx.fillText(v.saida, centerCard - 120, yAtual + 45);
+
+                ctx.fillStyle = '#64748B';
+                ctx.font = `600 11px ${FONTE_PADRAO}`;
+                let displayOrigem = locOrigem.length > 20 ? locOrigem.substring(0,20)+"..." : locOrigem;
+                ctx.fillText(displayOrigem, centerCard - 120, yAtual + 65);
+
+                ctx.fillStyle = '#94A3B8'; ctx.font = `bold 18px ${FONTE_PADRAO}`;
+                ctx.fillText("➔", centerCard, yAtual + 43);
+
+                ctx.fillStyle = '#0F172A'; ctx.font = `bold 24px ${FONTE_PADRAO}`;
+                ctx.fillText(v.chegada, centerCard + 120, yAtual + 45);
+                ctx.fillStyle = '#64748B'; ctx.font = `600 11px ${FONTE_PADRAO}`;
+                let displayDestino = locDestino.length > 20 ? locDestino.substring(0,20)+"..." : locDestino;
+                ctx.fillText(displayDestino, centerCard + 120, yAtual + 65);
+
+                ctx.textAlign = 'right';
+                let displayValor = v.displayValor;
+                if (displayValor.toUpperCase() === "ISENTO") {
+                    let isentoW = 75;
+                    desenharRetanguloArredondado(ctx, largura - margem - 30 - isentoW, yAtual + 35, isentoW, 30, 6, '#F1F5F9', '#CBD5E1');
+                    ctx.textAlign = 'center';
+                    ctx.fillStyle = '#334155';
+                    ctx.font = `bold 13px ${FONTE_PADRAO}`;
+                    ctx.fillText("ISENTO", largura - margem - 30 - (isentoW/2), yAtual + 55);
+                } else {
+                    let prefixo = "";
+                    let valorStr = displayValor;
+                    if (displayValor.includes("R$")) {
+                        const parts = displayValor.split("R$");
+                        prefixo = parts[0].trim();
+                        valorStr = "R$ " + parts[1].trim();
+                    }
+
+                    ctx.fillStyle = '#64748B'; ctx.font = `600 12px ${FONTE_PADRAO}`;
+                    ctx.fillText(prefixo, largura - margem - 30, yAtual + 35);
+
+                    ctx.fillStyle = '#E65100';
+                    if (valorStr.includes(",")) {
+                        let valParts = valorStr.split(",");
+                        let reais = valParts[0];
+                        let cents = "," + valParts[1];
+
+                        ctx.font = `bold 14px ${FONTE_PADRAO}`;
+                        let centWidth = ctx.measureText(cents).width;
+                        ctx.fillText(cents, largura - margem - 30, yAtual + 65);
+
+                        ctx.font = `bold 24px ${FONTE_PADRAO}`;
+                        ctx.fillText(reais, largura - margem - 30 - centWidth, yAtual + 65);
+                    } else {
+                        ctx.font = `bold 24px ${FONTE_PADRAO}`;
+                        ctx.fillText(valorStr, largura - margem - 30, yAtual + 65);
+                    }
+                }
+                ctx.textAlign = 'left';
+
+                yAtual += alturaCartao + espacoEntreCartoes;
+            });
+
+            canvas.toBlob(async function(blob) {
+                try {
+                    if(typeof window.ClipboardItem === "undefined") {
+                        throw new Error("NAVEGADOR_INCOMPATIVEL");
+                    }
+                    const item = new ClipboardItem({ "image/png": blob });
+                    await navigator.clipboard.write([item]);
+
+                    // NOTIFICAÇÃO QUANDO TEM MUITOS HORÁRIOS (RESTAURADA)
+                    if (dados.temMaisRestantes) {
+                        if(btn) {
+                            btn.style.background = "#E65100";
+                            btn.innerHTML = `⚠️ Copiar Restantes (${dados.restantesCount})`;
+                            btn.style.pointerEvents = 'auto';
+                        }
+                        alert("A lista de horários é muito grande! A primeira parte foi copiada.\n\nCole no WhatsApp e depois clique no botão novamente para copiar o restante.");
+                    } else {
+                        filaViagensGlobal = [];
+                        if(btn) {
+                            btn.style.background = "#28a745";
+                            btn.innerHTML = `✅ Card Copiado!`;
+                            setTimeout(() => {
+                                btn.style.background = "#303F9F";
+                                btn.innerHTML = dados.textoVolta || "📸 Copiar Tabela (Imagem)";
+                                btn.style.pointerEvents = 'auto';
+                            }, 3000);
+                        }
+                    }
+                } catch (err) {
+                    console.error("ERRO COMPLETO DE CÓPIA:", err);
+                    alert("⚠️ Detalhe do Erro para Análise:\n\n" + (err.message || err.toString()) + "\n\n(Tire um print para investigarmos)");
+                    if(btn) {
+                        btn.innerHTML = "❌ Erro! Tente de novo";
+                        btn.style.background = "#dc3545";
+                        setTimeout(() => {
+                            btn.innerHTML = dados.textoVolta || "📸 Copiar Tabela (Imagem)";
+                            btn.style.background = "#303F9F";
+                            btn.style.pointerEvents = 'auto';
+                        }, 4000);
+                    }
+                }
+            }, "image/png");
+        }
+
+        function processarLotePendente(isPrimeiroLote) {
+            let lote = filaViagensGlobal.splice(0, MAX_ITENS_POR_IMAGEM);
+            let temMais = filaViagensGlobal.length > 0;
+            let restantes = filaViagensGlobal.length;
+
+            desenharECopiarImagemTabela({
+                dataTexto: metadadosViagemGlobal.dataTexto,
+                trecho: metadadosViagemGlobal.trecho,
+                viagens: lote,
+                temMaisRestantes: temMais,
+                restantesCount: restantes,
+                isPrimeiroLote: isPrimeiroLote,
+                textoVolta: "📸 Copiar Tabela (Imagem)"
+            });
+        }
+
+        function extrairDadosTabela() {
+            const btn = document.getElementById('btn-copy-william');
+            const elementoData = document.querySelector('.service-date-title, #txt-data-ida-retorno, .active .date-value');
+            let dataTexto = elementoData ? elementoData.innerText.trim().toUpperCase() : "DATA";
+            dataTexto = dataTexto.replace('EM ', '').replace('COPIAR', '').trim();
+            const trecho = capturarTrecho();
+
+            if (filaViagensGlobal.length > 0 && metadadosViagemGlobal &&
+                metadadosViagemGlobal.dataTexto === dataTexto && metadadosViagemGlobal.trecho === trecho) {
+                processarLotePendente(false);
+                return;
+            }
+
+            filaViagensGlobal = [];
+            const blocosHorario = document.querySelectorAll('.service-col-3');
+
+            let viagensDiretas = [];
+            let viagensConexao = [];
+
+            blocosHorario.forEach(bloco => {
+                const linha = bloco.closest('.service-row') || bloco.parentElement.parentElement;
+                if (!linha) return;
+
+                const b = bloco.querySelectorAll('b');
+                const saida = b[0]?.innerText.trim() || "";
+                const chegada = b[1]?.innerText.trim() || "";
+
+                if (!saida) return;
+
+                let servico = linha.querySelector('.spn-class')?.innerText.trim() || "CONVENCIONAL";
+                const poltTxt = linha.querySelector('.service-availability, [class*="availability"]')?.innerText.replace(/[^0-9]/g, '') || "0";
+                const polt = parseInt(poltTxt);
+
+                if (polt <= 0) return;
+
+                let valorNovo = 0;
+                const celulas = linha.querySelectorAll('td, .price-family-container, .service-price-family');
+                for (let c of celulas) {
+                    let txt = c.innerText.toUpperCase();
+                    if ((txt.includes('BRL') || txt.includes('R$')) && !txt.includes('INDISPONÍVEL') && !txt.includes('ESGOTADO')) {
+                        valorNovo = extrairNumero(txt);
+                        if (valorNovo > 0) break;
+                    }
+                }
+
+                if (valorNovo === 0) return;
+
+                let displayValor = "A partir de R$ " + valorNovo.toLocaleString('pt-BR', { minimumFractionDigits: 2 });
+
+                let textoLinha = linha.innerText.toUpperCase();
+                let isConexao = textoLinha.includes('PARADA') || textoLinha.includes('CONEXÃO') || textoLinha.includes('MULTIPLAS') || servico.includes('MULTIPLAS');
+
+                if (isConexao) {
+                    if (!servico.includes("MÚLTIPLAS") && !servico.includes("MULTIPLAS")) {
+                        servico += " (Conexão)";
+                    } else {
+                        servico = "CONEXÃO (Múltiplas)";
+                    }
+                }
+
+                const textoPoltronas = polt === 1 ? "1 vaga" : `${polt} vagas`;
+                const viagemObj = { saida, chegada, servico, displayValor, textoPoltronas, isConexao };
+
+                if (isConexao) {
+                    viagensConexao.push(viagemObj);
+                } else {
+                    viagensDiretas.push(viagemObj);
+                }
+            });
+
+            let viagensFinais = [...viagensDiretas, ...viagensConexao];
+
+            if (viagensFinais.length > 0) {
+                filaViagensGlobal = viagensFinais;
+                metadadosViagemGlobal = { dataTexto, trecho };
+                processarLotePendente(true);
+            } else {
+                alert("Nenhum horário com vaga disponível encontrado.");
+            }
+        }
+
+        // ---- Lógica do cartão de remarcação ----
+        function espionarTrechosCompletos() {
+            try {
+                let origem = document.querySelector('#txt-origem')?.value || "";
+                let destino = document.querySelector('#txt-destino')?.value || "";
+                if (!origem || !destino) {
+                    const textoTopo = document.body.innerText.substring(0, 1500);
+                    const match = textoTopo.match(/de\s+(.*)\s+para\s+(.*?)(?:\n|em |$)/i);
+                    if (match) { origem = match[1].trim(); destino = match[2].trim(); }
+                }
+                if (origem && destino) {
+                    origem = limparCidade(origem);
+                    destino = limparCidade(destino);
+                    if (origem.length > 2 && destino.length > 2) {
+                        sessionStorage.setItem("william_cidades_longas", JSON.stringify({origem, destino}));
+                    }
+                }
+            } catch (erro) {}
+        }
+
+        function capturarDadosConfirmacao() {
+            let reserva = { tipo: "CONFERÊNCIA DE REMARCAÇÃO", origem: "---", destino: "---", data: "---", horario: "---", passageiro: "---", servico: "CONVENCIONAL", poltrona: "--" };
+            let textoAchatado = document.body.innerText.replace(/\s+/g, ' ').toUpperCase();
+
+            let mData = textoAchatado.match(/(\d{2}\/\d{2}\/\d{4})/);
+            if (mData) reserva.data = mData[1];
+
+            let mHora = textoAchatado.match(/(\d{2}:\d{2})\s*(?:-|ÀS|ATÉ)\s*(\d{2}:\d{2})/);
+            if (mHora) reserva.horario = `${mHora[1]} às ${mHora[2]}`;
+
+            let elementoPassageiro = document.querySelector('.passenger-name, .lbl-passenger');
+            if (elementoPassageiro && elementoPassageiro.innerText.trim() !== '') {
+                reserva.passageiro = elementoPassageiro.innerText.trim().toUpperCase();
+            } else {
+                let mNome = textoAchatado.match(/#\d+\s+([A-ZÀ-ÖØ-öø-ÿ\s]+?)(?=\s+(?:NORMAL|PASSE|IDOSO|ESTUDANTE|BPE|ID\sJOVEM|CRIAN[ÇC]A|GRATUIDADE|CORTESIA|RG|CPF|\d{3}))/);
+                if (mNome) reserva.passageiro = mNome[1].trim();
+            }
+
+            try {
+                const elOrigem = document.querySelector('b.b-search-origin');
+                const elDestino = document.querySelector('b.b-search-destination');
+                if (elOrigem && elOrigem.innerText) reserva.origem = elOrigem.innerText.trim();
+                if (elDestino && elDestino.innerText) reserva.destino = elDestino.innerText.trim();
+
+                const elPoltrona = document.querySelector('.confirm-passenger-list table tbody tr td.td-with-paragraph.text-center');
+                if (elPoltrona && elPoltrona.innerText) {
+                    let txtPoltrona = elPoltrona.innerText.replace(/\D/g, '');
+                    if (txtPoltrona) reserva.poltrona = txtPoltrona;
+                }
+
+                const elServico = document.querySelector('.confirm-passenger-list table tbody tr td:nth-child(5)');
+                if (elServico && elServico.innerText) {
+                    let txtTrechoServico = elServico.innerText.toUpperCase();
+                    let mServ = txtTrechoServico.match(/\(((?:EXECUTIVO|LEITO|SEMI\s*LEITO|CONVENCIONAL|DOUBLE|CONFORTO|PREMIUM|PROMO|FLEX)[^()]*)\)/);
+                    if (mServ) {
+                        reserva.servico = mServ[1].replace(/[^A-Z\s\+]/g, '').trim();
+                    } else {
+                        if (txtTrechoServico.includes('SEMI LEITO')) reserva.servico = 'SEMI LEITO';
+                        else if (txtTrechoServico.includes('LEITO')) reserva.servico = 'LEITO';
+                        else if (txtTrechoServico.includes('EXECUTIVO')) reserva.servico = 'EXECUTIVO';
+                        else if (txtTrechoServico.includes('CONVENCIONAL')) reserva.servico = 'CONVENCIONAL';
+                        else if (txtTrechoServico.includes('CAMA')) reserva.servico = 'CAMA';
+                        else if (txtTrechoServico.includes('LEITO PREMIUM')) reserva.servico = 'LEITO PREMIUM';
+                        else if (txtTrechoServico.includes('SEMI LEITO +CONFORTO')) reserva.servico = 'SEMI LEITO +CONFORTO';
+
+
+                    }
+                }
+            } catch (e) {}
+
+            if (reserva.origem === "---" || reserva.destino === "---") {
+                let regexTrecho = /\b([A-ZÀ-ÖØ-öø-ÿ\s\-()]{3,45})\s*(?:->|➔|→|>|[^\w\s()]+)\s*([A-ZÀ-ÖØ-öø-ÿ\s\-()]{3,45})\s*\(([^()]+)\)\s*(\d{1,3})\b/;
+                let mTrecho = textoAchatado.match(regexTrecho);
+                if (mTrecho) {
+                    reserva.origem = mTrecho[1].trim();
+                    reserva.destino = mTrecho[2].trim();
+                    if (reserva.poltrona === "--") reserva.poltrona = mTrecho[4];
+                } else {
+                    let mTrechoLongo = textoAchatado.match(/TRECHO\s+([A-ZÀ-ÖØ-öø-ÿ\s]+?)\s*-\s*[A-Z]{2}\s*(?:->|➔|→|>|[^\w\s()]+)\s*([A-ZÀ-ÖØ-öø-ÿ\s]+?)\s*-\s*[A-Z]{2}/);
+                    if (mTrechoLongo) {
+                        reserva.origem = mTrechoLongo[1].trim();
+                        reserva.destino = mTrechoLongo[2].trim();
+                    }
+                }
+            }
+
+            reserva.origem = limparCidade(reserva.origem);
+            reserva.destino = limparCidade(reserva.destino);
+
+            try {
+                let trechosMemoria = sessionStorage.getItem("william_cidades_longas");
+                if (trechosMemoria) {
+                    let dadosSalvos = JSON.parse(trechosMemoria);
+                    if (dadosSalvos.origem && dadosSalvos.destino && reserva.origem === "---") {
+                         reserva.origem = limparCidade(dadosSalvos.origem);
+                         reserva.destino = limparCidade(dadosSalvos.destino);
+                    }
+                }
+            } catch(e){}
+
+            return reserva;
+        }
+
+        function gerarImagemBilhete(reserva) {
+            const btn = document.getElementById('btn-bilhete-william');
+
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            const largura = 850;
+            const margem = 30;
+            const altura = 450;
+            canvas.width = largura; canvas.height = altura;
+
+            ctx.fillStyle = '#F4F6F8'; ctx.fillRect(0, 0, largura, altura);
+            ctx.fillStyle = '#303F9F'; ctx.fillRect(0, 0, largura, 85);
+
+            ctx.fillStyle = '#FFFFFF';
+            ctx.font = `600 20px ${FONTE_PADRAO}`;
+            ctx.fillText(`🔄 ${reserva.tipo}`, margem, 52);
+
+            let yAtual = 100;
+
+            ctx.shadowColor = 'rgba(0,0,0,0.05)'; ctx.shadowBlur = 6; ctx.shadowOffsetY = 2;
+            desenharRetanguloArredondado(ctx, margem, yAtual, largura - (margem * 2), 55, 6, '#FFF3F3', '#FFCDD2');
+            ctx.shadowColor = 'transparent';
+
+            ctx.fillStyle = '#B71C1C'; ctx.textAlign = 'center';
+            ctx.font = `bold 12px ${FONTE_PADRAO}`;
+            ctx.fillText("⚠️ ATENÇÃO: Verifique os dados abaixo. O bilhete final só será emitido após confirmação.", largura / 2, yAtual + 32);
+            ctx.textAlign = 'left';
+
+            yAtual += 70;
+
+            ctx.shadowColor = 'rgba(0,0,0,0.05)'; ctx.shadowBlur = 8; ctx.shadowOffsetY = 3;
+            desenharRetanguloArredondado(ctx, margem, yAtual, largura - (margem * 2), 120, 8, '#FFFFFF', '#CBD5E1');
+            ctx.shadowColor = 'transparent';
+
+            ctx.fillStyle = '#888888'; ctx.font = `11px ${FONTE_PADRAO}`;
+            ctx.fillText('PASSAGEIRO', margem + 25, yAtual + 25);
+            ctx.fillStyle = '#333333'; ctx.font = `bold 18px ${FONTE_PADRAO}`;
+            let nomeVisual = reserva.passageiro.length > 40 ? reserva.passageiro.substring(0, 40) + "..." : reserva.passageiro;
+            ctx.fillText(nomeVisual, margem + 25, yAtual + 48);
+
+            ctx.textAlign = 'right';
+            ctx.fillStyle = '#888888'; ctx.font = `11px ${FONTE_PADRAO}`;
+            ctx.fillText('CLASSE', largura - margem - 25, yAtual + 25);
+
+            ctx.fillStyle = '#E65100'; ctx.font = `bold 16px ${FONTE_PADRAO}`;
+            ctx.fillText(reserva.servico, largura - margem - 25, yAtual + 48);
+            ctx.textAlign = 'left';
+
+            ctx.fillStyle = '#EEEEEE'; ctx.fillRect(margem + 20, yAtual + 65, largura - (margem * 2) - 40, 1.5);
+
+            let textoItin = `${reserva.origem}  ➔  ${reserva.destino}`;
+            let tamFonteItin = 20;
+            let maxLarguraItin = largura - (margem * 2) - 50;
+            ctx.font = `bold ${tamFonteItin}px ${FONTE_PADRAO}`;
+
+            while(ctx.measureText(textoItin).width > maxLarguraItin && tamFonteItin > 12) {
+                tamFonteItin--;
+                ctx.font = `bold ${tamFonteItin}px ${FONTE_PADRAO}`;
+            }
+            if (ctx.measureText(textoItin).width > maxLarguraItin) {
+                while (ctx.measureText(textoItin + "...").width > maxLarguraItin && textoItin.length > 0) {
+                    textoItin = textoItin.slice(0, -1);
+                }
+                textoItin += "...";
+            }
+
+            ctx.fillStyle = '#303F9F';
+            ctx.fillText(textoItin, margem + 25, yAtual + 102);
+
+            yAtual += 135;
+
+            ctx.shadowColor = 'rgba(0,0,0,0.05)'; ctx.shadowBlur = 8; ctx.shadowOffsetY = 3;
+            desenharRetanguloArredondado(ctx, margem, yAtual, largura - (margem * 2), 80, 8, '#FFFFFF', '#CBD5E1');
+            ctx.shadowColor = 'transparent';
+
+            ctx.fillStyle = '#888888'; ctx.font = `11px ${FONTE_PADRAO}`; ctx.fillText('DATA', margem + 25, yAtual + 28);
+            ctx.fillStyle = '#333333'; ctx.font = `bold 18px ${FONTE_PADRAO}`; ctx.fillText(`📅 ${reserva.data}`, margem + 25, yAtual + 55);
+
+            ctx.fillStyle = '#EEEEEE'; ctx.fillRect(margem + 220, yAtual + 18, 2, 44);
+
+            ctx.fillStyle = '#888888'; ctx.font = `11px ${FONTE_PADRAO}`; ctx.fillText('HORÁRIO', margem + 245, yAtual + 28);
+            ctx.fillStyle = '#333333'; ctx.font = `bold 18px ${FONTE_PADRAO}`; ctx.fillText(`⏱️ ${reserva.horario}`, margem + 245, yAtual + 55);
+
+            let boxPW = 110; let boxPX = largura - margem - boxPW - 15; let boxPY = yAtual + 12;
+            desenharRetanguloArredondado(ctx, boxPX, boxPY, boxPW, 56, 8, '#E8F5E9');
+            ctx.textAlign = 'center';
+            ctx.fillStyle = '#2E7D32'; ctx.font = `bold 10px ${FONTE_PADRAO}`; ctx.fillText('POLTRONA', boxPX + (boxPW/2), boxPY + 18);
+            ctx.font = `bold 24px ${FONTE_PADRAO}`; ctx.fillText(reserva.poltrona, boxPX + (boxPW/2), boxPY + 45);
+            ctx.textAlign = 'left';
+
+            canvas.toBlob(async function(blob) {
+                try {
+                    if(typeof ClipboardItem === "undefined") {
+                        throw new Error("ClipboardItem_Nao_Suportado_Neste_Navegador");
+                    }
+                    const item = new ClipboardItem({ "image/png": blob });
+                    await navigator.clipboard.write([item]);
+
+                    if(btn) {
+                        btn.style.background = "#28a745";
+                        btn.innerHTML = `✅ Bilhete Premium Copiado!`;
+                        setTimeout(() => {
+                            btn.style.background = "#303F9F";
+                            btn.innerHTML = "📸 Gerar Prévia de Remarcação";
+                            btn.style.pointerEvents = 'auto';
+                        }, 3000);
+                    }
+                } catch (err) {
+                    console.error("ERRO COMPLETO DE CÓPIA:", err);
+                    alert("⚠️ Detalhe do Erro para Análise:\n\n" + (err.message || err.toString()) + "\n\n(Tire um print para investigarmos)");
+                    if(btn) {
+                        btn.innerHTML = "❌ Erro! (Veja o aviso)";
+                        btn.style.background = "#dc3545";
+                        setTimeout(() => {
+                            btn.innerHTML = "📸 Gerar Prévia de Remarcação";
+                            btn.style.background = "#303F9F";
+                            btn.style.pointerEvents = 'auto';
+                        }, 4000);
+                    }
+                }
+            }, "image/png");
+        }
+
+        function adicionarDrag(btn, acaoClique) {
+            let isDragging = false;
+            let dragStartX, dragStartY;
+            let shiftX, shiftY;
+
+            function onMouseMove(e) {
+                if (Math.abs(e.clientX - dragStartX) > 10 || Math.abs(e.clientY - dragStartY) > 10) {
+                    isDragging = true;
+                    btn.style.bottom = 'auto';
+                    btn.style.right = 'auto';
+                    btn.style.left = (e.clientX - shiftX) + 'px';
+                    btn.style.top = (e.clientY - shiftY) + 'px';
+                }
+            }
+
+            function onMouseUp(e) {
+                document.removeEventListener('mousemove', onMouseMove);
+                document.removeEventListener('mouseup', onMouseUp);
+                btn.style.cursor = 'grab';
+            }
+
+            btn.onmousedown = function(e) {
+                isDragging = false;
+                dragStartX = e.clientX;
+                dragStartY = e.clientY;
+                shiftX = e.clientX - btn.getBoundingClientRect().left;
+                shiftY = e.clientY - btn.getBoundingClientRect().top;
+                btn.style.cursor = 'grabbing';
+                document.addEventListener('mousemove', onMouseMove);
+                document.addEventListener('mouseup', onMouseUp);
+            };
+
+            btn.onclick = function(e) {
+                if (isDragging) return;
+
+                const txtOriginal = btn.innerHTML;
+                btn.innerHTML = "⌛ Copiando...";
+                btn.style.pointerEvents = 'none';
+
+                try {
+                    acaoClique();
+                } catch(erro) {
+                    console.error(erro);
+                    btn.innerHTML = txtOriginal;
+                    btn.style.pointerEvents = 'auto';
+                }
+            };
+        }
+
+        // ---- Loop principal ----
+        function gerenciarBotoesETela() {
+            espionarTrechosCompletos();
+
+            const temHorarios = document.querySelector('.service-col-3') !== null;
+
+            let textoGeral = document.body.textContent.toUpperCase();
+            let isConfirmacaoOuRemarcacao = (textoGeral.includes('TIPO DA OPERAÇÃO') || textoGeral.includes('TIPO DA OPERACAO')) && textoGeral.includes('PASSAGEIRO');
+
+            let btnTabela = document.getElementById('btn-copy-william');
+            if (temHorarios && !isConfirmacaoOuRemarcacao) {
+                if (!btnTabela) {
+                    btnTabela = document.createElement('button');
+                    btnTabela.id = 'btn-copy-william';
+                    btnTabela.innerHTML = '📸 Copiar Tabela (Imagem)';
+                    btnTabela.style = "position:fixed; bottom:20px; right:20px; z-index:999999; padding:10px 18px; background:#303F9F; color:white; border:2px solid #fff; border-radius:8px; font-weight:bold; box-shadow:0 3px 10px rgba(0,0,0,0.25); font-size:14px; cursor:grab;";
+                    document.body.appendChild(btnTabela);
+
+                    adicionarDrag(btnTabela, extrairDadosTabela);
+                }
+                btnTabela.style.display = 'block';
+
+                const elementoData = document.querySelector('.service-date-title, #txt-data-ida-retorno, .active .date-value');
+                let curDataTexto = elementoData ? elementoData.innerText.trim().toUpperCase().replace('EM ', '').replace('COPIAR', '').trim() : "";
+                let curTrecho = capturarTrecho();
+
+                if (filaViagensGlobal.length > 0 && metadadosViagemGlobal) {
+                    if (metadadosViagemGlobal.dataTexto !== curDataTexto || metadadosViagemGlobal.trecho !== curTrecho) {
+                        filaViagensGlobal = [];
+                        btnTabela.style.background = "#303F9F";
+                        btnTabela.innerHTML = '📸 Copiar Tabela (Imagem)';
+                        btnTabela.style.pointerEvents = 'auto';
+                    }
+                }
+
+            } else if (btnTabela) {
+                btnTabela.style.display = 'none';
+            }
+
+            let btnBilhete = document.getElementById('btn-bilhete-william');
+            if (isConfirmacaoOuRemarcacao) {
+                if (!btnBilhete) {
+                    btnBilhete = document.createElement('button');
+                    btnBilhete.id = 'btn-bilhete-william';
+                    btnBilhete.innerHTML = '📸 Gerar Prévia de Remarcação';
+                    btnBilhete.style = "position:fixed; bottom:80px; right:20px; z-index:999999; padding:10px 18px; background:#303F9F; color:white; border:2px solid #fff; border-radius:8px; font-weight:bold; box-shadow:0 3px 10px rgba(0,0,0,0.25); font-size:14px; cursor:grab;";
+                    document.body.appendChild(btnBilhete);
+
+                    adicionarDrag(btnBilhete, () => {
+                        gerarImagemBilhete(capturarDadosConfirmacao());
+                    });
+                }
+                btnBilhete.style.display = 'block';
+            } else if (btnBilhete) {
+                btnBilhete.style.display = 'none';
+            }
+        }
+
+        return {
+            id: 'guanabara_print_horarios',
+            name: 'SMART BUS - Print dos horarios e remarcacoes',
+            defaultOn: true,
+            fixo: true, // módulo embutido no código-fonte, não pode ser excluído pelo painel
+
+            init() {
+                // este widget só faz sentido no sistema de reservas da Guanabara/SmartBus
+                if (!location.hostname.includes('smarttravelit.com')) return;
+
+                filaViagensGlobal = [];
+                metadadosViagemGlobal = null;
+                linkAtual = window.location.hash;
+
+                intervalHashId = setInterval(() => {
+                    if (window.location.hash !== linkAtual) {
+                        linkAtual = window.location.hash;
+                        let rotaBase = linkAtual.split('?')[0];
+                        const rotasRaiz = ['#/', '#/home', '#/dashboard', ''];
+
+                        if (rotasRaiz.includes(rotaBase)) {
+                            filaViagensGlobal = [];
+                        }
+                    }
+                }, 1000);
+
+                intervalBotoesId = setInterval(gerenciarBotoesETela, 1500);
+            },
+
+            destroy() {
+                if (intervalHashId) clearInterval(intervalHashId);
+                if (intervalBotoesId) clearInterval(intervalBotoesId);
+                intervalHashId = null;
+                intervalBotoesId = null;
+
+                document.getElementById('btn-copy-william')?.remove();
+                document.getElementById('btn-bilhete-william')?.remove();
+
+                filaViagensGlobal = [];
+                metadadosViagemGlobal = null;
+            }
+        };
+    }
+
+    registrarModulo(criarModuloGuanabara());
+
+    // =========================================================================
+    // MÓDULO 6 — Zerar Datas (Pesquisa de bilhetes)
+    // =========================================================================
+    function criarModuloZerarDatas() {
+        let observer = null;
+        let delayId = null;
+        let handleLoad = null;
+
+        function paginaCorreta() {
+            const titulo = document.querySelector('h3.page-title');
+            return titulo &&
+                   titulo.innerText.trim() === 'Pesquisa de bilhetes';
+        }
+
+        function alterarCampos() {
+            // executa somente na página desejada
+            if (!paginaCorreta()) return;
+
+            // =====================================================
+            // ZERAR CAMPOS DE DATA
+            // =====================================================
+            const camposData = document.querySelectorAll(`
+                input.hasDatepicker,
+                input[id^="dp"],
+                input[placeholder*="dd"],
+                input[placeholder*="DD"]
+            `);
+            camposData.forEach(campo => {
+                if (campo.type === 'hidden') return;
+                if (campo.value !== '00/00/0000') {
+                    campo.value = '00/00/0000';
+                    campo.dispatchEvent(new Event('focus', { bubbles: true }));
+                    campo.dispatchEvent(new Event('input', { bubbles: true }));
+                    campo.dispatchEvent(new Event('change', { bubbles: true }));
+                    campo.dispatchEvent(new Event('blur', { bubbles: true }));
+                    console.log('[Zerar Datas] Data zerada');
+                }
+            });
+
+            // =====================================================
+            // ALTERAR SELECT2 PARA TODOS
+            // =====================================================
+            const selects = document.querySelectorAll('select');
+            selects.forEach(select => {
+                const optionTodos = [...select.options].find(opt =>
+                    opt.text.trim().toUpperCase() === 'TODOS'
+                );
+                if (optionTodos) {
+                    select.value = optionTodos.value;
+                    select.dispatchEvent(new Event('change', {
+                        bubbles: true
+                    }));
+                    select.dispatchEvent(new Event('input', {
+                        bubbles: true
+                    }));
+                    // Atualiza visualmente Select2
+                    if (
+                        window.jQuery &&
+                        jQuery(select).hasClass('select2-hidden-accessible')
+                    ) {
+                        jQuery(select).trigger('change.select2');
+                    }
+                    console.log('[Zerar Datas] Select alterado para TODOS');
+                }
+            });
+        }
+
+        return {
+            id: 'zerar_datas',
+            name: 'SMART BUS - Zerar datas',
+            defaultOn: true,
+            fixo: true, // módulo embutido no código-fonte, não pode ser excluído pelo painel
+
+            init() {
+                handleLoad = () => {
+                    setTimeout(alterarCampos, 1500);
+                };
+
+                if (document.readyState === 'complete') {
+                    handleLoad();
+                } else {
+                    window.addEventListener('load', handleLoad);
+                }
+
+                observer = new MutationObserver(() => {
+                    if (!paginaCorreta()) return;
+                    clearTimeout(delayId);
+                    delayId = setTimeout(() => {
+                        alterarCampos();
+                    }, 300);
+                });
+                observer.observe(document.body, {
+                    childList: true,
+                    subtree: true
+                });
+            },
+
+            destroy() {
+                if (observer) {
+                    observer.disconnect();
+                    observer = null;
+                }
+                if (delayId) {
+                    clearTimeout(delayId);
+                    delayId = null;
+                }
+                if (handleLoad) {
+                    window.removeEventListener('load', handleLoad);
+                    handleLoad = null;
+                }
+            }
+        };
+    }
+
+    registrarModulo(criarModuloZerarDatas());
+
+    // =========================================================================
+    // MÓDULO 7 — Preencher Dados dos Passageiros (painel de notas + copiar)
+    // =========================================================================
+    function criarModuloPreencherPassageiros() {
+        let styleEl = null;
+        let toastEl = null;
+        let panelEl = null;
+        let observer = null;
+        let handleDocumentClick = null;
+        let handleMinimizar = null;
+        let minimized = false;
+
+        function isPaginaPassageiros() {
+            const legends = document.querySelectorAll('.step-legend');
+            return Array.from(legends).some(el =>
+                el.innerText.trim().toLowerCase().includes('passageiros')
+            );
+        }
+
+        function showToast(msg) {
+            if (!toastEl) return;
+            toastEl.textContent = msg;
+            toastEl.classList.add('show');
+            setTimeout(() => {
+                toastEl.classList.remove('show');
+            }, 2500);
+        }
+
+        function setNativeValue(input, value) {
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype,
+                'value'
+            ).set;
+
+            nativeInputValueSetter.call(input, value);
+
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+
+        function fillPassengers() {
+            const textarea = document.getElementById('tm-textarea');
+            if (!textarea) return;
+
+            const raw = textarea.value.trim();
+
+            if (!raw) {
+                showToast('⚠ Textarea vazia.');
+                return;
+            }
+
+            const blocks = raw
+                .split(/\n\s*\n/)
+                .map(b => b.trim())
+                .filter(Boolean);
+
+            const cards = Array.from(document.querySelectorAll('.card')).filter(card =>
+                card.querySelector('.sales-passenger-title')
+            );
+
+            if (!cards.length) {
+                showToast('⚠ Nenhum formulário encontrado.');
+                return;
+            }
+
+            const cardsPorTipo = {};
+
+            cards.forEach(card => {
+                const b = card.querySelector('.sales-passenger-title b.orange');
+
+                if (!b) return;
+
+                const tipo = b.innerText
+                    .trim()
+                    .replace(/^#\d+\s*/, '')
+                    .toUpperCase()
+                    .trim();
+
+                if (!cardsPorTipo[tipo]) cardsPorTipo[tipo] = [];
+
+                cardsPorTipo[tipo].push(card);
+            });
+
+            const tipoUsado = {};
+            let filled = 0;
+            let skipped = 0;
+
+            blocks.forEach((block) => {
+                const lines = block.split('\n').map(l => l.trim());
+
+                const nome = lines[0] || '';
+                const doc = lines[1] || '';
+                const tel = lines[2] || '';
+                const tipo = (lines[3] || 'NORMAL').toUpperCase().trim();
+
+                tipoUsado[tipo] = tipoUsado[tipo] || 0;
+
+                const available = cardsPorTipo[tipo] || [];
+                const card = available[tipoUsado[tipo]];
+
+                if (!card) {
+                    console.log(`[Preencher Passageiros] Sem card disponível para tipo "${tipo}"`);
+                    skipped++;
+                    tipoUsado[tipo]++;
+                    return;
+                }
+
+                tipoUsado[tipo]++;
+
+                const info = card.querySelector('.sales-passenger-info');
+
+                if (!info) return;
+
+                const inputs = info.querySelectorAll('input');
+
+                if (inputs[1]) {
+                    setNativeValue(inputs[1], nome);
+                    filled++;
+                }
+
+                if (inputs[2]) {
+                    setNativeValue(inputs[2], tel);
+                }
+
+                if (inputs[4]) {
+                    setNativeValue(inputs[4], '01/05/2026');
+                }
+
+                if (inputs[5]) {
+                    setNativeValue(inputs[5], doc);
+                }
+            });
+
+            const msg = skipped > 0
+                ? `✓ ${filled} preenchido(s), ${skipped} ignorado(s) sem campo.`
+                : `✓ ${filled} passageiro(s) preenchido(s)!`;
+
+            showToast(msg);
+        }
+
+        function injectPanel() {
+            if (document.getElementById('tm-panel')) return;
+            if (!isPaginaPassageiros()) return;
+
+            document.body.insertAdjacentHTML('beforeend', `
+                <div id="tm-panel">
+                    <div id="tm-panel-header">
+                        <span id="tm-panel-label">notas</span>
+                        <button id="tm-btn-min" title="Minimizar">−</button>
+                    </div>
+
+                    <div id="tm-panel-body">
+                        <textarea id="tm-textarea" placeholder="Cole os passageiros aqui…" spellcheck="false"></textarea>
+                        <button id="tm-btn-confirm">⏎ Preencher campos</button>
+                    </div>
+                </div>
+            `);
+
+            panelEl = document.getElementById('tm-panel');
+            minimized = false;
+
+            handleMinimizar = () => {
+                minimized = !minimized;
+                document.getElementById('tm-panel-body').style.display = minimized ? 'none' : '';
+                document.getElementById('tm-btn-min').textContent = minimized ? '+' : '−';
+            };
+
+            document.getElementById('tm-btn-min').addEventListener('click', handleMinimizar);
+        }
+
+        function removePanel() {
+            panelEl?.remove();
+            panelEl = null;
+        }
+
+        function getPassengerText(table) {
+            const rows = table.querySelectorAll('tbody tr');
+
+            if (!rows.length) return null;
+
+            const ths = Array.from(table.querySelectorAll('thead th'));
+
+            let iNome = -1;
+            let iDoc = -1;
+            let iTel = -1;
+
+            ths.forEach((th, i) => {
+                const txt = th.innerText.trim().toLowerCase();
+
+                if (txt.includes('passageiro')) {
+                    iNome = i;
+                } else if (txt.includes('documento') || txt.includes('doc')) {
+                    iDoc = i;
+                } else if (txt.includes('telefone') || txt.includes('tel')) {
+                    iTel = i;
+                }
+            });
+
+            if (iNome < 0) iNome = 1;
+            if (iDoc < 0) iDoc = 2;
+            if (iTel < 0) iTel = 4;
+
+            const lines = [];
+            const nomesVistos = new Set();
+
+            rows.forEach(row => {
+                const cells = row.querySelectorAll('td');
+
+                if (!cells.length) return;
+
+                const get = (idx) => cells[idx] ? cells[idx].innerText.trim() : '';
+
+                const nome = get(iNome).replace(/^#\d+\s*/, '');
+                const doc = get(iDoc).replace(/^[A-Za-zÀ-ÿ\s]+[-–]\s*/i, '').trim();
+                const tel = get(iTel);
+                const tipo = cells[3] ? cells[3].innerText.trim() : 'NORMAL';
+
+                if (!nome) return;
+
+                if (nomesVistos.has(nome.toLowerCase())) return;
+
+                nomesVistos.add(nome.toLowerCase());
+
+                lines.push(`${nome}\n${doc}\n${tel}\n${tipo}`);
+            });
+
+            return lines.join('\n\n');
+        }
+
+        function injectButton(table) {
+            if (document.getElementById('tm-copy-btn')) return;
+
+            const th = table.querySelector('thead tr th');
+
+            if (!th) return;
+
+            const btn = document.createElement('button');
+
+            btn.id = 'tm-copy-btn';
+            btn.innerHTML = 'Copiar Dados';
+
+            th.appendChild(btn);
+
+            btn.addEventListener('click', () => {
+                const text = getPassengerText(table);
+
+                if (!text) {
+                    showToast('⚠ Nenhum passageiro encontrado.');
+                    return;
+                }
+
+                navigator.clipboard.writeText(text).then(() => {
+                    btn.classList.add('copied');
+                    btn.innerHTML = '✓ Copiado';
+                    showToast('✓ Passageiros copiados!');
+
+                    setTimeout(() => {
+                        btn.classList.remove('copied');
+                        btn.innerHTML = '&#128203; Copiar';
+                    }, 2000);
+                }).catch(() => {
+                    const ta = document.createElement('textarea');
+
+                    ta.value = text;
+                    ta.style.position = 'fixed';
+                    ta.style.opacity = '0';
+
+                    document.body.appendChild(ta);
+
+                    ta.select();
+                    document.execCommand('copy');
+
+                    document.body.removeChild(ta);
+
+                    showToast('✓ Passageiros copiados!');
+                });
+            });
+        }
+
+        return {
+            id: 'preencher_passageiros',
+            name: 'SMART BUS - Preencher Dados dos Passageiros',
+            defaultOn: true,
+            fixo: true, // módulo embutido no código-fonte, não pode ser excluído pelo painel
+
+            init() {
+                // este widget só faz sentido no sistema de reservas da Guanabara/SmartBus
+                if (!location.hostname.includes('smarttravelit.com')) return;
+
+                styleEl = document.createElement('style');
+                styleEl.textContent = `
+                    @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&display=swap');
+
+                    #tm-panel {
+                        position: fixed;
+                        top: 270px;
+                        right: 300px;
+                        z-index: 999999;
+                        width: 260px;
+                        background: #1c1a1e;
+                        border: 1px solid #322f36;
+                        border-radius: 14px;
+                        box-shadow: 0 10px 32px rgba(0, 0, 0, 0.55);
+                        overflow: hidden;
+                        font-family: 'DM Mono', monospace;
+                    }
+
+                    #tm-panel-header {
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        padding: 9px 12px;
+                        background: #232025;
+                        border-bottom: 1px solid #322f36;
+                        cursor: default;
+                        user-select: none;
+                        display: none;
+                    }
+
+                    #tm-panel-label {
+                        font-size: 10px;
+                        letter-spacing: 0.1em;
+                        color: #a89d94;
+                        text-transform: uppercase;
+                        font-weight: 700;
+                    }
+
+                    #tm-btn-min {
+                        background: #2a272d;
+                        border: 1px solid #3a3640;
+                        color: #f3ece6;
+                        cursor: pointer;
+                        font-size: 14px;
+                        line-height: 1;
+                        padding: 2px 7px;
+                        border-radius: 7px;
+                        transition: all 0.15s;
+                    }
+
+                    #tm-btn-min:hover {
+                        background: #35313a;
+                        color: #ffffff;
+                    }
+
+                    #tm-panel-body {
+                        padding: 10px;
+                        background: #1c1a1e;
+                    }
+
+                    #tm-textarea {
+                        width: 100%;
+                        height: 130px;
+                        resize: none;
+                        background: #232025;
+                        border: 1px solid #3a3640;
+                        border-radius: 10px;
+                        color: #f3ece6;
+                        font-family: 'DM Mono', monospace;
+                        font-size: 12px;
+                        line-height: 1.6;
+                        padding: 10px;
+                        box-sizing: border-box;
+                        outline: none;
+                        transition: all 0.2s;
+                        box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.3);
+                    }
+
+                    #tm-textarea:focus {
+                        border-color: #3b82f6;
+                        box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
+                    }
+
+                    #tm-textarea::placeholder {
+                        color: #6f665e;
+                    }
+
+                    #tm-copy-btn {
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 6px;
+                        margin-left: 12px;
+                        padding: 4px 12px;
+                        background: darkgreen;
+                        color: #fff;
+                        border: none;
+                        border-radius: 6px;
+                        font-size: 12px;
+                        font-weight: 600;
+                        cursor: pointer;
+                        vertical-align: middle;
+                        transition: background 0.2s;
+                    }
+
+                    #tm-copy-btn:hover {
+                        background: #15803d;
+                    }
+
+                    #tm-copy-btn.copied {
+                        background: #475569;
+                    }
+
+                    #tm-toast {
+                        position: fixed;
+                        bottom: 24px;
+                        right: 24px;
+                        z-index: 1000000;
+                        background: #1c1a1e;
+                        color: #f3ece6;
+                        font-size: 13px;
+                        padding: 10px 18px;
+                        border-radius: 8px;
+                        border: 1px solid #322f36;
+                        opacity: 0;
+                        transform: translateY(6px);
+                        transition: all 0.2s ease;
+                        pointer-events: none;
+                        font-family: sans-serif;
+                        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+                    }
+
+                    #tm-toast.show {
+                        opacity: 1;
+                        transform: translateY(0);
+                    }
+
+                    #tm-btn-confirm {
+                        width: 100%;
+                        margin-top: 8px;
+                        padding: 8px 0;
+                        background: linear-gradient(135deg, #60a5fa, #2563eb);
+                        color: #ffffff;
+                        border: none;
+                        border-radius: 10px;
+                        font-family: 'DM Mono', monospace;
+                        font-size: 12px;
+                        font-weight: 700;
+                        cursor: pointer;
+                        transition: background 0.2s, transform 0.1s, box-shadow 0.2s;
+                        box-shadow: 0 6px 16px rgba(59, 130, 246, 0.35);
+                    }
+
+                    #tm-btn-confirm:hover {
+                        box-shadow: 0 8px 20px rgba(59, 130, 246, 0.45);
+                    }
+
+                    #tm-btn-confirm:active {
+                        transform: scale(0.98);
+                    }
+
+                    #tm-btn-confirm:disabled {
+                        background: #3a3640;
+                        color: #6f665e;
+                        cursor: default;
+                        box-shadow: none;
+                    }
+                `;
+                document.head.appendChild(styleEl);
+
+                toastEl = document.createElement('div');
+                toastEl.id = 'tm-toast';
+                document.body.appendChild(toastEl);
+
+                handleDocumentClick = (e) => {
+                    if (e.target && e.target.id === 'tm-btn-confirm') {
+                        fillPassengers();
+                    }
+                };
+                document.addEventListener('click', handleDocumentClick);
+
+                observer = new MutationObserver(() => {
+                    if (isPaginaPassageiros()) {
+                        injectPanel();
+                    } else {
+                        removePanel();
+                    }
+
+                    const table = document.querySelector('.tbl-coupon-passengers');
+
+                    if (table) injectButton(table);
+                });
+
+                observer.observe(document.body, {
+                    childList: true,
+                    subtree: true
+                });
+
+                injectPanel();
+
+                const table = document.querySelector('.tbl-coupon-passengers');
+
+                if (table) injectButton(table);
+            },
+
+            destroy() {
+                if (observer) {
+                    observer.disconnect();
+                    observer = null;
+                }
+
+                if (handleDocumentClick) {
+                    document.removeEventListener('click', handleDocumentClick);
+                    handleDocumentClick = null;
+                }
+
+                if (handleMinimizar) {
+                    document.getElementById('tm-btn-min')?.removeEventListener('click', handleMinimizar);
+                    handleMinimizar = null;
+                }
+
+                removePanel();
+                document.getElementById('tm-copy-btn')?.remove();
+
+                toastEl?.remove();
+                toastEl = null;
+
+                styleEl?.remove();
+                styleEl = null;
+
+                minimized = false;
+            }
+        };
+    }
+
+    registrarModulo(criarModuloPreencherPassageiros());
+
+    // =========================================================================
+    // MÓDULO 8 — Botões de Mensagens Rápidas (Tallos)
+    // =========================================================================
+    function criarModuloTallosBotoesMensagens() {
+        const GRUPO_ID = 'tallos-botoes-mensagens';
+        const TOOLBAR_SELECTOR = '.ql-toolbar.ql-snow';
+        const EDITOR_SELECTOR = '.ql-editor';
+        const SUGESTAO_SELECTOR = 'button.suggestion-button.tg-btn_tertiary[title="Ver sugestão de resposta"]';
+
+        const MENSAGENS = [
+            { icon: '🤖', title: 'SAUDACAO DIRETA', texto: `Prezado(a) cliente, esse atendimento gerou um protocolo de número: @PROTOCOLO
+
+@SALDACAO @CLIENTE, tudo bem? Me chamo @ATENDENTE, seu agente de viagens. Como posso ajudar?` },
+
+            { icon: '👍', title: 'SIM CLIENTE', texto: `Prezado(a) cliente, esse atendimento gerou um protocolo de número: @PROTOCOLO
+@SALDACAO @CLIENTE, tudo bem? Me chamo @ATENDENTE, seu agente de viagens.
+
+Identificamos que sua tentativa de compra anterior deu erro e foi cancelada. Irei gerar sua nova reserva e acompanhar todo o processo para garantir que seja finalizada com sucesso, conforme sua solicitação.
+` },
+
+            { icon: '🚌', title: 'REMARCACAO', texto: `🚌 Remarcação de Passagem
+
+*Para remarcar, preciso que você envie:*
+📄 Bilhete em PDF ou foto.
+🪪 Foto do RG ou CNH (frente e verso) do titular da passagem.
+🕒 Nova data e horário desejados.
+
+⚠️ Se faltar menos de 3h pro embarque, há multa de 20%. Passagens que já ultrapassaram esse prazo de 3h, a remarcação só pode ser feita para o *MESMO TRECHO*.
+
+🔁 Remarcações anteriores com multa *terão nova cobrança*.
+💵 Se o novo horário for mais caro, *será cobrada a diferença*.
+📍 Em passagens intermunicipais do estado de RJ, alterações só até 1h antes do embarque. Depois disso, o bilhete perde validade.
+Trechos intermunicipais do estado de MG é necessário solicitar até 12h antes.
+Viagens intermunicipais dentro do estado de São Paulo só podem ser remarcadas ou canceladas se solicitado até no máximo 8h antes do horário de partida segundo o Artigo 93 do DECRETO Nº 29.913.
+
+💳 Pagamentos apenas via *PIX CNPJ*.
+💻 Na nossa plataforma, há também uma taxa de serviço para remarcações.
+
+*Qualquer dúvida, estou à disposição!*` },
+
+            { icon: '✈', title: 'TRECHO', texto: `Por gentileza, poderia informar as seguintes informações sobre a sua viagem:
+
+Origem: cidade de partida
+Destino: cidade de chegada
+Data: data da partida da viagem
+
+*Informe se a viagem tem volta*` },
+
+            { icon: '⛔', title: 'POLTRONA OCUPADA', texto: `A poltrona do(a) senhor(a) vai ficar bloqueada por até 10 minutos devido a tentativa cancelada anteriormente, poderia ser outra poltrona?
+
+*CINZAS LIVRES*` },
+
+            { icon: '💺', title: 'POLTRONAS', texto: `💺 Mapa de Poltronas
+
+🟩 Verde: poltronas sugeridas / opções de escolha
+⬜ Cinza: poltronas disponíveis
+🟥 Vermelho: poltronas vendidas / ocupadas
+🟧 Laranja: poltronas pendentes / em processo de venda
+
+Por gentileza, escolha a(s) poltrona(s) desejada(s) para dar continuidade ao atendimento.` },
+
+            { icon: '🪪', title: 'DADOS', texto: `Dados do Passageiro -
+Nome:
+RG:
+CPF:
+Data de Nascimento:` },
+
+            { icon: '⚠️', title: 'CONFERE', texto: `*Por gentileza, poderia conferir se todas as informações da sua reserva estão corretas? (Passageiro, Trecho, Data, horário e poltrona*)` },
+
+            { icon: '⚠️', title: 'REFORCA DADOS', texto: `Senhor(a), reforçamos que é essencial a conferência de todos os dados do bilhete, a fim de evitar qualquer tipo de transtorno futuro.
+
+A verificação de todas as informações do bilhete é de responsabilidade do passageiro.` },
+
+{ icon: '🔗', title: 'LINK', texto: `Segue link para pagamentos via PIX e cartão, lembrando que para pagamentos via cartão de crédito, os dados do comprador são referentes ao proprietário do cartão.` },
+
+            { icon: '🔗', title: 'CV', texto: `Segue link para pagamento via Cartão de crédito e PIX:
+
+PAGAMENTO CARTÃO.
+1: Utilizar o virtual para finalizar a compra online.
+2: Em COMPRADOR colocar os dados COMPLETOS do titular do cartão virtual.
+3: Em PAGAMENTO colocar os dados CONFORME consta no cartão virtual.
+4: Limpar os dados do navegador ou trocar de navegador, antes de tentar novamente.
+5: Trocar o E-mail, pois alguns e-mails o nosso sistema não reconhece e acaba cancelando a reserva.
+6: No CEP da fatura, preencher com o CEP do local onde foi solicitado o cartão.
+
+LINK DE PAGAMENTO VÁLIDO POR APENAS 30 MINUTOS.` },
+
+            { icon: '❖', title: 'PIX', texto: `Segue abaixo os dados bancários para transferência via PIX!
+
+Valor: R$
+
+Nome: VALE VIAGENS/ ANTÔNIO CLERVES
+CHAVE CNPJ: 18.826.066/0001-09
+
+Emissão da passagem mediante ao envio do comprovante de pagamento!` },
+
+            { icon: '🏁', title: 'COMPRA FIM', texto: `Sua compra foi realizada com sucesso! 🎉
+
+Suas passagens serão enviadas por este chat em instantes. Além disso, uma cópia também será encaminhada para o e-mail informado no momento da compra.
+
+Posso ajudar em mais alguma coisa?` },
+
+            { icon: '🔎', title: 'VERIFICA', texto: `Confira se os dados do seu bilhete estão corretos
+Verifique trecho, data, horário e dados pessoais no bilhete anexo ou enviado por e-mail.
+
+Se houver algum erro, avise em até 30 minutos.
+
+Alterações devem ser solicitadas com até 3 horas antes do embarque, dentro do nosso horário de atendimento. Após esse prazo, será cobrada multa de 20% do valor da passagem.` },
+
+            { icon: '🤔', title: 'AGRADECE', texto: `Agradeço o contato, confiança e preferência em nosso trabalho. Ficamos à disposição para lhe atender posteriormente.
+
+@SALDACAO e uma excelente viagem.` },
+
+            { icon: '🤔', title: 'DUVIDA', texto: `📍 Informações importantes para o embarque
+
+📄 Documentos aceitos (originais):
+• CIN/RG (físico ou digital pelo app Gov.br)
+• CNH (física ou digital pelo app Carteira Digital de Trânsito)
+• Carteira de Trabalho (física)
+• Passaporte ou RIC
+• e-Título (no aplicativo, com foto visível)
+👶 Viagem de menores
+• Até 6 anos incompletos: podem viajar gratuitamente no colo de um responsável pagante, conforme disponibilidade.
+• Até 12 anos: apresentar certidão de nascimento, RG ou passaporte (originais). Também aceitamos RG digital pelo Gov.br e cópia autenticada em cartório.
+• A partir de 12 anos: apresentar RG ou passaporte (original). Também aceitamos RG digital pelo Gov.br e cópia autenticada em cartório.
+👩‍👧 Menores de 16 anos acompanhados
+
+Podem viajar com pais, avós, irmãos maiores de 18 anos, tios, sobrinhos maiores de 18 anos, tutores ou guardiões legais, desde que seja possível comprovar o parentesco por meio de documentos originais.
+
+👥 Acompanhante sem parentesco
+É necessário que seja maior de 18 anos e apresente autorização dos pais ou responsáveis, com firma reconhecida em cartório. Modelos disponíveis em: https://autoriza.net.
+
+👦 Menor de 16 anos desacompanhado
+Só pode viajar com documento de identidade e autorização dos pais ou responsáveis, com firma reconhecida em cartório. Modelos disponíveis em: https://autoriza.net.
+
+✅ Adolescentes de 16 a 18 anos
+Podem viajar sozinhos, sem autorização, desde que apresentem documento de identidade original e válido.
+
+⚠️ Os horários podem sofrer alterações, pois os ônibus estão sujeitos às condições da viagem e do trânsito.
+Estamos à disposição 24h. Qualquer dúvida, é só chamar! 😊` },
+
+            { icon: '🖨️', title: 'REENVIO', texto: `Para reenvio de PDF preciso que me encaminhe a foto da documentação frente e verso do titular do bilhete, para que fique registrado em sistema que o mesmo está ciente da solicitação.
+
+E informar o e-mail de reenvio.` },
+
+            { icon: '🛂', title: 'EMBARQUE', texto: `Basta mostrar o PDF do bilhete ao motorista pela tela do celular no momento do embarque junto com o documento original físico com foto ( PREFERÊNCIA RG) que consegue embarcar normalmente, mas caso deseje imprimir os bilhetes, basta chegar 30min antes do horário de embarque, se dirigir até o guichê e com o localizador, imprimir o bilhete.` },
+
+            { icon: '🛎️', title: 'RESERVA', texto: `Estarei gerando a reserva do(a) senhor(a) para darmos continuidade por aqui, tudo bem?` },
+
+            { icon: '🔁', title: 'CONTINUIDADE', texto: `@CLIENTE, caso deseje dar continuidade, será criada uma reserva conforme sua solicitação anterior, porém, forneceremos algumas orientações que estarão lhe ajudando na conclusão de sua compra.
+
+Gostaria de dar continuidade a sua reserva agora mesmo?` },
+
+            { icon: '📢', title: 'FALTA DE COMUNICACAO', texto: `Atendimento interrompido por falta de comunicação. Se desejar, estamos disponíveis para continuar a atendê-lo(a).
+
+Lembrando que nosso atendimento é 24 horas e 100% humanizado, além de fornecemos suporte durante toda sua viagem!` },
+
+            { icon: '☎️', title: 'SAC', texto: `SAC: 0800 728 1992 - Opção 1, em seguida opção 9 e opção 1 novamente` },
+
+            { icon: '🙌', title: 'CONSEGUIU FINALIZAR', texto: `Que bom que deu tudo certo!, Tenha uma ótima viagem! Lembre-se que estamos disponíveis pelo WhatsApp para te ajudar no que precisar.
+
+Comprando conosco por aqui, além dos melhores valores de tarifação e atendimento 100% humanizado, você terá suporte durante toda a sua viagem!, lembrando que esse é um portal de vendas 24 horas
+
+Salve já nosso contato para as suas próximas adesões.` },
+
+            { icon: '📁', title: 'DOCUMENTO', texto: `Me envia o bilhete e documento do titular por favor` },
+
+            { icon: '❌ ', title: 'ERRO', texto: `Provavelmente houve algum erro durante o preenchimento dos dados ou uma instabilidade no sistema, o que fez com que o pagamento não fosse reconhecido corretamente.
+Para darmos continuidade, estarei gerando uma nova reserva para o(a) senhor(a). Tudo bem?` },
+        ];
+
+        let styleEl = null;
+        let observer = null;
+
+        function esconderSugestaoResposta() {
+            document.querySelectorAll(SUGESTAO_SELECTOR).forEach(btn => {
+                btn.style.display = 'none';
+            });
+        }
+
+        // Adicionado: sem isso o destroy() não desfazia o que o init() escondia
+        function mostrarSugestaoResposta() {
+            document.querySelectorAll(SUGESTAO_SELECTOR).forEach(btn => {
+                btn.style.display = '';
+            });
+        }
+
+        function inserirTexto(texto, btn) {
+            const editor = document.querySelector(EDITOR_SELECTOR);
+            if (!editor) return;
+
+            editor.innerHTML = texto
+                .replace(/\r/g, '')
+                .split('\n')
+                .map(l => l.trim() === '' ? '<p><br></p>' : `<p>${l}</p>`)
+                .join('');
+
+            editor.dispatchEvent(new Event('input', { bubbles: true }));
+
+            const original = btn.innerHTML;
+            btn.innerHTML = '✅';
+            setTimeout(() => btn.innerHTML = original, 800);
+        }
+
+        function inserirBotoes() {
+            const toolbar = document.querySelector(TOOLBAR_SELECTOR);
+            if (!toolbar || document.getElementById(GRUPO_ID)) return;
+
+            const grupo = document.createElement('div');
+            grupo.id = GRUPO_ID;
+            grupo.style.cssText = `display:flex;gap:3px;margin-right:15px;`;
+
+            MENSAGENS.forEach(msg => {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.innerHTML = msg.icon;
+                btn.setAttribute('data-tooltip', msg.title);
+                btn.style.cssText = `
+                    width:28px;height:28px;background:transparent;border:none;
+                    border-radius:6px;font-size:16px;cursor:pointer;opacity:.75;
+                    display:flex;align-items:center;justify-content:center;
+                `;
+                btn.onmouseenter = () => btn.style.opacity = '1';
+                btn.onmouseleave = () => btn.style.opacity = '.75';
+                btn.onclick = () => inserirTexto(msg.texto, btn);
+                grupo.appendChild(btn);
+            });
+
+            toolbar.insertBefore(grupo, toolbar.firstChild);
+        }
+
+        return {
+            id: 'tallos_botoes_mensagens',
+            name: 'TALLOS - Barras e mensagens',
+            defaultOn: true,
+            fixo: true, // módulo embutido no código-fonte, não pode ser excluído pelo painel
+
+            init() {
+                // este widget só faz sentido no chat do Tallos (era @match .../app/chat*)
+                if (!location.hostname.includes('tallos.com.br') || !location.pathname.includes('/app/chat')) return;
+
+                styleEl = document.createElement('style');
+                styleEl.innerHTML = `
+                    #${GRUPO_ID} button { position: relative; }
+                    #${GRUPO_ID} button::after {
+                        content: attr(data-tooltip);
+                        position: absolute;
+                        top: -34px;
+                        left: 50%;
+                        transform: translateX(-50%);
+                        background: #000;
+                        color: #fff;
+                        padding: 4px 8px;
+                        border-radius: 6px;
+                        font-size: 11px;
+                        white-space: nowrap;
+                        opacity: 0;
+                        pointer-events: none;
+                        transition: opacity .15s ease;
+                        z-index: 9999;
+                    }
+                    #${GRUPO_ID} button:hover::after { opacity: 1; }
+                `;
+                document.head.appendChild(styleEl);
+
+                observer = new MutationObserver(() => {
+                    esconderSugestaoResposta();
+                    inserirBotoes();
+                });
+                observer.observe(document.body, { childList: true, subtree: true });
+
+                esconderSugestaoResposta();
+                inserirBotoes();
+            },
+
+            destroy() {
+                if (observer) {
+                    observer.disconnect();
+                    observer = null;
+                }
+                document.getElementById(GRUPO_ID)?.remove();
+                styleEl?.remove();
+                styleEl = null;
+                mostrarSugestaoResposta();
+            }
+        };
+    }
+
+    registrarModulo(criarModuloTallosBotoesMensagens());
+
+    // =========================================================================
+    // MÓDULO 9 — Copiar com um Clique (SmartBus/Guanabara)
+    // =========================================================================
+    function criarModuloSmartbusCopiarClique() {
+        // Adicionado: guarda cada elemento + handler para o destroy() conseguir
+        // remover o listener e reverter o estilo (o script original nunca desligava)
+        const elementosAtivos = [];
+
+        function isReserva() {
+            return document.querySelector('.page-title')?.textContent?.trim() === 'Reserva';
+        }
+
+        function normalizarDocumento(texto) {
+            if (texto.includes('-')) {
+                return texto.split('-').slice(1).join('-').trim();
+            }
+            return texto.trim();
+        }
+
+        function aplicarCliqueCopiar(el, tipo = 'normal') {
+            if (!el || el.dataset.copiarAtivo) return;
+            let texto = el.textContent?.trim();
+            if (!texto) return;
+            if (tipo === 'documento') {
+                texto = normalizarDocumento(texto);
+            }
+
+            el.dataset.copiarAtivo = 'true';
+            el.style.border = '1px dashed #3b82f6';
+            el.style.padding = '4px 10px';
+            el.style.borderRadius = '6px';
+            el.style.cursor = 'pointer';
+            el.style.transition = 'border-color .2s ease, background-color .2s ease';
+            el.title = 'Clique para copiar';
+
+            const handler = (e) => {
+                e.stopPropagation();
+                navigator.clipboard.writeText(texto);
+                el.style.borderColor = 'green';
+                el.style.backgroundColor = '#e6f4ea';
+                setTimeout(() => {
+                    el.style.borderColor = '#3b82f6';
+                    el.style.backgroundColor = 'transparent';
+                }, 1200);
+            };
+
+            el.addEventListener('click', handler);
+            elementosAtivos.push({ el, handler });
+        }
+
+        function aplicar() {
+            if (!isReserva()) return;
+
+            document.querySelectorAll('.col-coupon-service-title b').forEach(el => aplicarCliqueCopiar(el));
+
+            document.querySelectorAll('.col-coupon-service b').forEach(b => {
+                if (/\d{2}\/\d{2}\/\d{4}/.test(b.textContent)) {
+                    aplicarCliqueCopiar(b);
+                }
+            });
+
+            const tituloPassageiros = [...document.querySelectorAll('h3,h4')]
+                .find(h => h.textContent.trim() === 'Passageiros');
+
+            if (tituloPassageiros) {
+                const bloco = tituloPassageiros.closest('.card, .card-body, .card-coupon-area');
+                bloco?.querySelectorAll('tbody tr').forEach(tr => {
+                    const tds = tr.querySelectorAll('td');
+                    aplicarCliqueCopiar(tds[1]);
+                    aplicarCliqueCopiar(tds[2], 'documento');
+                    aplicarCliqueCopiar(tds[4]);
+                });
+            }
+
+            document.querySelectorAll('.card-coupon-actions').forEach(card => {
+                [...card.querySelectorAll('*')].forEach(el => {
+                    if (el.textContent?.trim() === 'E-mail') {
+                        const email = el.nextElementSibling;
+                        if (email) aplicarCliqueCopiar(email);
+                    }
+                });
+            });
+        }
+
+        let observer = null;
+
+        return {
+            id: 'smartbus_copiar_clique',
+            name: 'SMART BUS - Area de clique e copia',
+            defaultOn: true,
+            fixo: true, // módulo embutido no código-fonte, não pode ser excluído pelo painel
+
+            init() {
+                // este widget só faz sentido no sistema de reservas da Guanabara/SmartBus
+                if (!location.hostname.includes('smarttravelit.com')) return;
+
+                observer = new MutationObserver(aplicar);
+                observer.observe(document.body, { childList: true, subtree: true });
+                aplicar();
+            },
+
+            destroy() {
+                if (observer) {
+                    observer.disconnect();
+                    observer = null;
+                }
+
+                elementosAtivos.forEach(({ el, handler }) => {
+                    el.removeEventListener('click', handler);
+                    el.style.border = '';
+                    el.style.padding = '';
+                    el.style.borderRadius = '';
+                    el.style.cursor = '';
+                    el.style.transition = '';
+                    el.style.borderColor = '';
+                    el.style.backgroundColor = '';
+                    el.title = '';
+                    delete el.dataset.copiarAtivo;
+                });
+                elementosAtivos.length = 0;
+            }
+        };
+    }
+
+    registrarModulo(criarModuloSmartbusCopiarClique());
+
+// =========================================================================
+// MÓDULO 10 — Tallos: Ocultar Cliente
+// =========================================================================
+function criarModuloTallosOcultarCliente() {
+    let styleEl = null;
+    let overlayPrincipal = null;
+    let tarjaNome = null;
+    let observador = null;
+    let intervaloId = null;
+    let debounceBlindarId = null;
+
+    function verificarSeEstaNaFila() {
+        let naFila = false;
+        const elementos = document.querySelectorAll('span, p, div, h1, h2, h3, strong, b');
+
+        for (let el of elementos) {
+            if (el.childElementCount === 0 && el.offsetParent !== null) {
+                const txt = (el.textContent || '').toUpperCase().trim();
+                if (txt.includes('FILA DE ESPERA')) {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.left >= 0 && rect.left < 300 && rect.top >= 0 && rect.top < 150) {
+                        naFila = true;
+                        break;
+                    }
+                }
+            }
+        }
+        return naFila;
+    }
+
+    function blindar() {
+        const isNaFila = verificarSeEstaNaFila();
+
+        let btnIniciarNormal = null;
+        let isMassaActive = false;
+
+        const elementos = document.querySelectorAll('button, div[role="button"], span');
+
+        for (let el of elementos) {
+            if (el.offsetParent === null) continue;
+
+            const txt = (el.textContent || '').toUpperCase().trim();
+
+            if (txt.includes('INICIAR ATENDIMENTOS')) {
+                isMassaActive = true;
+            } else if (
+                txt === 'INICIAR' || txt === 'ATENDER' || txt === 'ACEITAR' ||
+                (txt.includes('INICIAR') && txt.length < 25 && !txt.includes('ATENDIMENTOS'))
+            ) {
+                const rect = el.getBoundingClientRect();
+                if (rect.left > 300 && rect.top >= 0 && rect.top < 150) {
+                    btnIniciarNormal = el;
+                }
+            }
+        }
+
+        if (isMassaActive) {
+            if (overlayPrincipal) overlayPrincipal.style.display = 'none';
+            if (tarjaNome) tarjaNome.style.display = 'none';
+        } else if (btnIniciarNormal) {
+            let header = btnIniciarNormal.parentElement;
+            let achouCabecalhoSeguro = false;
+
+            while (header && header !== document.body) {
+                const w = header.getBoundingClientRect().width;
+                const h = header.getBoundingClientRect().height;
+
+                if (w > 400 && h > 40 && h < 150) {
+                    achouCabecalhoSeguro = true;
+                    break;
+                }
+                header = header.parentElement;
+            }
+
+            if (achouCabecalhoSeguro) {
+                const rectHeader = header.getBoundingClientRect();
+                overlayPrincipal.style.top = rectHeader.bottom + 'px';
+                overlayPrincipal.style.left = rectHeader.left + 'px';
+
+                tarjaNome.style.top = rectHeader.top + 'px';
+                tarjaNome.style.left = rectHeader.left + 'px';
+                tarjaNome.style.height = rectHeader.height + 'px';
+                tarjaNome.style.width = (rectHeader.width - 300) + 'px';
+            } else {
+                overlayPrincipal.style.top = '135px';
+                overlayPrincipal.style.left = '360px';
+                tarjaNome.style.top = '65px';
+                tarjaNome.style.left = '360px';
+                tarjaNome.style.height = '70px';
+                tarjaNome.style.width = 'calc(100% - 660px)';
+            }
+
+            overlayPrincipal.style.display = 'flex';
+            tarjaNome.style.display = 'flex';
+        } else {
+            if (overlayPrincipal) overlayPrincipal.style.display = 'none';
+            if (tarjaNome) tarjaNome.style.display = 'none';
+        }
+
+        if (isNaFila) {
+            document.body.classList.add('modo-fila-ativa');
+
+            const barraBusca = document.querySelector('input[placeholder*="contato"], input[placeholder*="Buscar"]');
+            if (barraBusca) {
+                const limiteTopo = barraBusca.getBoundingClientRect().bottom + 5;
+
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+                let node;
+
+                while ((node = walker.nextNode())) {
+                    const txt = node.nodeValue.trim();
+                    if (txt.length === 0 || txt === 'Cliente Oculto' || txt === '👤') continue;
+
+                    const parent = node.parentElement;
+                    if (!parent) continue;
+
+                    const rect = parent.getBoundingClientRect();
+
+                    if (rect.left >= 0 && rect.left < 360 && rect.top > limiteTopo && rect.bottom > 0) {
+                        if (txt.length > 0 && txt.length <= 2 && /^[A-Za-zÀ-ÿ]+$/.test(txt)) {
+                            const txtUpper = txt.toUpperCase();
+                            if (txtUpper !== 'AM' && txtUpper !== 'PM') {
+                                if (typeof node._originalText === 'undefined') {
+                                    node._originalText = txt;
+                                }
+                                node.nodeValue = '👤';
+                                continue;
+                            }
+                        }
+
+                        if (txt.length < 3) continue;
+
+                        const txtUpper = txt.toUpperCase();
+
+                        const termosProtegidos = [
+                            'SETOR', 'CANAIS', 'INICIAR', 'ATENDER', 'ATENDIMENTO',
+                            'TRANSFERIR', 'ETIQUETA', 'MARCAR', 'MENSAGEM', 'EXCLUIR',
+                            'RESOLVER', 'CLIENTE OCULTO', 'AGUARDANDO', 'ATENDENTE',
+                            'OCULTA', 'MAIS RECENTE', 'GERÊNCIA', 'FILA',
+                            'BUSCAR', 'CONTATO', 'NOVOS', 'TODOS'
+                        ];
+
+                        const isProtegido = termosProtegidos.some(termo => txtUpper.includes(termo));
+                        const isHora = /^\d{2}:\d{2}/.test(txt) || txtUpper === 'AM' || txtUpper === 'PM';
+                        const isApenasNumeros = /^[\d\s\-\(\)\+]+$/.test(txt);
+
+                        if (!isProtegido && !isHora && !isApenasNumeros) {
+                            if (parent.hasAttribute('title')) parent.removeAttribute('title');
+                            if (parent.hasAttribute('data-original-title')) parent.removeAttribute('data-original-title');
+                            if (parent.hasAttribute('data-bs-title')) parent.removeAttribute('data-bs-title');
+                            if (parent.hasAttribute('aria-label')) parent.removeAttribute('aria-label');
+
+                            if (typeof node._originalText === 'undefined') {
+                                node._originalText = txt;
+                            }
+
+                            node.nodeValue = node.nodeValue.replace(txt, 'Cliente Oculto');
+                        }
+                    }
+                }
+            }
+        } else {
+            document.body.classList.remove('modo-fila-ativa');
+
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+            let node;
+            while ((node = walker.nextNode())) {
+                if (node._originalText) {
+                    if (node.nodeValue.includes('Cliente Oculto')) {
+                        node.nodeValue = node.nodeValue.replace('Cliente Oculto', node._originalText);
+                    } else if (node.nodeValue.includes('👤')) {
+                        node.nodeValue = node.nodeValue.replace('👤', node._originalText);
+                    }
+                }
+            }
+        }
+
+        const textosModal = document.querySelectorAll('div[role="dialog"] p, div[role="dialog"] span, div[role="dialog"] div');
+        textosModal.forEach(el => {
+            if (el.childElementCount === 0) {
+                const textoOriginal = el.textContent || '';
+                if (textoOriginal.includes('Deseja iniciar o atendimento com') && !textoOriginal.includes('este cliente?')) {
+                    el.textContent = 'Deseja iniciar o atendimento com este cliente?';
+                }
+            }
         });
     }
 
-    registrarTodosOsScriptsCustom();
+    return {
+        id: 'tallos_ocultar_cliente',
+        name: 'TALLOS — Ocultar Cliente',
+        defaultOn: true,
+        fixo: true,
+
+        init() {
+            if (!location.hostname.includes('tallos.com.br')) return;
+            if (document.getElementById('escudo-absoluto')) return;
+
+            styleEl = document.createElement('style');
+            styleEl.innerHTML = `
+                div[role="dialog"], .modal {
+                    z-index: 999999 !important;
+                }
+                body.modo-fila-ativa .tooltip,
+                body.modo-fila-ativa .popover,
+                body.modo-fila-ativa [role="tooltip"] {
+                    display: none !important;
+                    opacity: 0 !important;
+                    pointer-events: none !important;
+                }
+            `;
+            document.head.appendChild(styleEl);
+
+            overlayPrincipal = document.createElement('div');
+            overlayPrincipal.id = 'escudo-absoluto';
+            overlayPrincipal.style.cssText = 'position:fixed; right:0; bottom:0; background:rgba(240, 242, 245, 0.95); backdrop-filter:blur(10px); z-index:999; display:none; flex-direction:column; justify-content:center; align-items:center;';
+            overlayPrincipal.innerHTML = `
+                <div style="background:#fff; padding:20px 25px; border-radius:8px; box-shadow:0 4px 15px rgba(0,0,0,0.05); text-align:center; max-width:300px; border:1px solid #e1e4e8;">
+                    <div style="background:#e8f0fe; width:45px; height:45px; border-radius:50%; display:flex; justify-content:center; align-items:center; margin:0 auto 15px auto;">
+                        <span style="font-size:20px;">🔒</span>
+                    </div>
+                    <h2 style="color:#203a7a; margin:0 0 8px 0; font-size:16px; font-weight:bold;">Atendimento Oculto</h2>
+                    <p style="font-size:13px; color:#5f6368; line-height:1.4; margin:0;">
+                        Clique em <b>Iniciar</b> para assumir o ticket.
+                    </p>
+                </div>
+            `;
+            document.body.appendChild(overlayPrincipal);
+
+            tarjaNome = document.createElement('div');
+            tarjaNome.id = 'tarja-nome-cliente';
+            tarjaNome.style.cssText = 'position:fixed; background:rgba(240, 242, 245, 0.98); backdrop-filter:blur(10px); z-index:999; display:none; align-items:center; padding-left:20px; border-bottom:1px solid #ddd;';
+            tarjaNome.innerHTML = `<span style="font-size:16px; font-weight:bold; color:#555;">👤 Cliente Oculto</span>`;
+            document.body.appendChild(tarjaNome);
+
+            // Antes o observer chamava blindar() a cada mutação individual, e ainda
+            // rodava um setInterval de 300ms em paralelo — ou seja, em telas de chat
+            // com atualização constante (Tallos), blindar() podia rodar dezenas de
+            // vezes por segundo fazendo querySelectorAll('*') + TreeWalker no body
+            // inteiro a cada chamada. Agora as mutações são agrupadas (debounce) numa
+            // só chamada, e o intervalo cai para 1s — serve só de rede de segurança
+            // para mudanças de layout que não disparam mutação de DOM (scroll/resize).
+            const blindarComDebounce = () => {
+                clearTimeout(debounceBlindarId);
+                debounceBlindarId = setTimeout(blindar, 120);
+            };
+
+            observador = new MutationObserver(blindarComDebounce);
+            observador.observe(document.body, { childList: true, subtree: true });
+
+            blindar();
+            intervaloId = setInterval(blindar, 1000);
+        },
+
+        destroy() {
+            if (observador) {
+                observador.disconnect();
+                observador = null;
+            }
+
+            if (intervaloId) {
+                clearInterval(intervaloId);
+                intervaloId = null;
+            }
+
+            clearTimeout(debounceBlindarId);
+            debounceBlindarId = null;
+
+            overlayPrincipal?.remove();
+            tarjaNome?.remove();
+            styleEl?.remove();
+
+            overlayPrincipal = null;
+            tarjaNome = null;
+            styleEl = null;
+            document.body.classList.remove('modo-fila-ativa');
+        }
+    };
+}
+
+registrarModulo(criarModuloTallosOcultarCliente());
+
+// =========================================================================
+// MÓDULO 11 — Botão Preencher Email
+// =========================================================================
+function criarModuloSmartBusPreencherEmail() {
+    const EMAIL = 'gilmario12.2025@gmail.com';
+
+    const BOTAO_ID = 'btn-preencher-email';
+
+    let observer = null;
+
+    function setNativeValue(input, value) {
+        const setter = Object.getOwnPropertyDescriptor(
+            HTMLInputElement.prototype,
+            'value'
+        ).set;
+
+        setter.call(input, value);
+
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    function injectEmailButton() {
+        const div = document.querySelector('.row.row-form-btns');
+
+        if (!div) return;
+        if (document.getElementById(BOTAO_ID)) return;
+
+        div.style.display = 'flex';
+        div.style.alignItems = 'center';
+
+        const btn = document.createElement('button');
+        btn.id = BOTAO_ID;
+        btn.type = 'button';
+        btn.textContent = 'Preencher email';
+
+        Object.assign(btn.style, {
+            background: '#2563eb',
+            color: '#fff',
+            border: 'none',
+            borderRadius: '4px',
+            padding: '10px 18px',
+            cursor: 'pointer',
+            fontWeight: '600',
+            marginLeft: '10px'
+        });
+
+        btn.addEventListener('click', () => {
+            const lightbox = document.querySelector('.div-lightbox-content');
+
+            if (!lightbox) {
+                alert('Lightbox não encontrada!');
+                return;
+            }
+
+            const campoEmail = lightbox.querySelector('input.input');
+
+            if (!campoEmail) {
+                alert('Campo de e-mail não encontrado!');
+                return;
+            }
+
+            setNativeValue(campoEmail, EMAIL);
+            campoEmail.focus();
+        });
+
+        const btnEnviar = [...div.querySelectorAll('button')]
+            .find(b => b.textContent.trim().toUpperCase().includes('ENVIAR'));
+
+        if (btnEnviar) {
+            div.insertBefore(btn, btnEnviar);
+        } else {
+            div.appendChild(btn);
+        }
+    }
+
+    return {
+        id: 'preencher-email',
+        name: 'SMART BUS - Botão Preencher Email',
+        defaultOn: true,
+        fixo: true,
+
+        init() {
+            observer = new MutationObserver(injectEmailButton);
+
+            observer.observe(document.body, {
+                childList: true,
+                subtree: true
+            });
+
+            injectEmailButton();
+        },
+
+        destroy() {
+            observer?.disconnect();
+            observer = null;
+
+            document.getElementById(BOTAO_ID)?.remove();
+        }
+    };
+}
+
+registrarModulo(criarModuloSmartBusPreencherEmail());
+
+// =========================================================================
+// MÓDULO 12 — Horário + Serviço
+// =========================================================================
+function criarModuloHorarioServico() {
+
+    let observer = null;
+    let interval = null;
+    let style = null;
+
+    function atualizar() {
+
+        document.querySelectorAll("app-servicerow").forEach(servicerow => {
+
+            const titulo = servicerow.querySelector(".seat-map-route h4");
+            const horarioCol = servicerow.querySelector(".service-info .service-col-3");
+            const servico = servicerow.querySelector(".service-info .service-col-7 span");
+
+            if (!titulo || !horarioCol || !servico) return;
+
+            const textoOriginal = horarioCol.textContent
+                .replace(/\s+/g, " ")
+                .trim();
+
+            const primeiroHorario = (textoOriginal.match(/\d{2}:\d{2}/) || [""])[0];
+
+            const texto = ` | ${primeiroHorario} | ${servico.textContent.trim()}`;
+
+            titulo.style.display = "flex";
+            titulo.style.alignItems = "center";
+            titulo.style.flexWrap = "nowrap";
+
+            let info = titulo.querySelector(".tm-info");
+
+            if (!info) {
+
+                info = document.createElement("span");
+                info.className = "tm-info";
+
+                info.style.marginLeft = "10px";
+                info.style.whiteSpace = "nowrap";
+                info.style.fontWeight = "700";
+                info.style.fontSize = "inherit";
+                info.style.color = "inherit";
+
+                titulo.appendChild(info);
+            }
+
+            if (info.textContent !== texto) {
+                info.textContent = texto;
+            }
+
+        });
+
+    }
+
+    return {
+
+        id: "horario-servico",
+
+        name: "SMART BUS - Horário + Serviço",
+
+        defaultOn: true,
+
+        fixo: false,
+
+        init() {
+
+            style = document.createElement("style");
+
+            style.textContent = `
+                .seat-map-route h4 > div{
+                    display:none !important;
+                }
+            `;
+
+            document.head.appendChild(style);
+
+            atualizar();
+
+            observer = new MutationObserver(atualizar);
+
+            observer.observe(document.body, {
+                childList: true,
+                subtree: true
+            });
+
+            interval = setInterval(atualizar, 1000);
+
+        },
+
+        destroy() {
+
+            observer?.disconnect();
+
+            observer = null;
+
+            clearInterval(interval);
+
+            interval = null;
+
+            style?.remove();
+
+            style = null;
+
+            document.querySelectorAll(".tm-info").forEach(e => e.remove());
+
+        }
+
+    };
+
+}
+
+registrarModulo(criarModuloHorarioServico());
+
+// =========================================================================
+// MÓDULO 13 — Copiar Link (modal de compartilhamento)
+// =========================================================================
+function criarModuloCopiarLink() {
+    const ESTILO_ID = 'tmm-copiar-link-style';
+    let observer = null;
+
+    function garantirEstilo() {
+        if (document.getElementById(ESTILO_ID)) return;
+        const style = document.createElement('style');
+        style.id = ESTILO_ID;
+        style.textContent = `
+            .smart-copy-wrapper {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            .smart-copy-wrapper input[type="text"] {
+                flex: 1;
+            }
+            .smart-copy-btn {
+                padding: 6px 14px;
+                background: #2563eb;
+                color: #fff;
+                border: none;
+                border-radius: 5px;
+                cursor: pointer;
+                font-weight: bold;
+                font-size: 13px;
+                white-space: nowrap;
+                transition: background-color .2s ease;
+            }
+            .smart-copy-btn:hover {
+                background: #3b82f6;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // Reaproveitável por outros módulos: verifica se o módulo com esse id está ativo no painel
+    function isEnabled(id) {
+        const mod = modulos.find(m => m.id === id);
+        return mod ? !!mod._ativo : false;
+    }
+
+    // Troca o texto do botão temporariamente (feedback de "copiado") e depois volta ao original
+    function setCopiedState(btn, textoTemporario, textoOriginal, duracaoMs = 1500) {
+        btn.textContent = textoTemporario;
+        setTimeout(() => {
+            btn.textContent = textoOriginal;
+        }, duracaoMs);
+    }
+
+    /* ---------------- COPY LINK ---------------- */
+    function moverBotaoCopiarLink() {
+        const modal = document.querySelector('.div-lightbox-content');
+        if (!modal) return;
+        const input = modal.querySelector('input[type="text"]');
+        if (!input) return;
+        let wrapper = input.closest('.smart-copy-wrapper');
+        let btn = wrapper?.querySelector('.smart-copy-btn');
+        if (!wrapper) {
+            wrapper = document.createElement('div');
+            wrapper.className = 'smart-copy-wrapper';
+            input.parentNode.insertBefore(wrapper, input);
+            wrapper.appendChild(input);
+        }
+        if (!btn) {
+            btn = document.createElement('button');
+            btn.className = 'smart-copy-btn';
+            btn.textContent = 'Copiar link';
+            btn.onclick = async () => {
+                if (!isEnabled('copyLink')) return;
+                try {
+                    await navigator.clipboard.writeText(input.value || '');
+                    setCopiedState(btn, '✅ Copiado', 'Copiar link');
+                } catch (e) {
+                    input.select();
+                    input.setSelectionRange(0, 99999);
+                    document.execCommand('copy');
+                    setCopiedState(btn, '✅ Copiado', 'Copiar link');
+                }
+            };
+            wrapper.appendChild(btn);
+        }
+        btn.style.display = isEnabled('copyLink') ? '' : 'none';
+    }
+
+    return {
+        id: 'copyLink',
+        name: 'SMART BUS - Copiar Link',
+        defaultOn: true,
+        fixo: true, // módulo embutido no código-fonte, não pode ser excluído pelo painel
+
+        init() {
+            garantirEstilo();
+            observer = new MutationObserver(moverBotaoCopiarLink);
+            observer.observe(document.body, { childList: true, subtree: true });
+            moverBotaoCopiarLink();
+        },
+
+        destroy() {
+            if (observer) {
+                observer.disconnect();
+                observer = null;
+            }
+            document.querySelector('.smart-copy-btn')?.remove();
+        }
+    };
+}
+
+registrarModulo(criarModuloCopiarLink());
+
+// =========================================================================
+// MÓDULO 14 — Remover Acentos ao Colar (Nomes)
+// =========================================================================
+function criarModuloRemoverAcentos() {
+    let handlePaste = null;
+
+    function removerAcentos(texto) {
+        return texto
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '');
+    }
+
+    // Se o texto tiver "ç"/"Ç" em algum ponto, corta ali e descarta o resto inteiro
+    function cortarNoCedilha(texto) {
+        const idx = texto.search(/[çÇ]/);
+        if (idx === -1) return texto;
+        return texto.slice(0, idx);
+    }
+
+    function processarTexto(texto) {
+        const cortado = cortarNoCedilha(texto);
+        return removerAcentos(cortado);
+    }
+
+    function disparaEventosAngular(input) {
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    function tratarPaste(event) {
+        const input = event.target;
+
+        if (!input.classList || !input.classList.contains('ng-valid')) return;
+        if (input.tagName !== 'INPUT') return;
+
+        event.preventDefault();
+
+        const textoColado = (event.clipboardData || window.clipboardData).getData('text');
+        const textoLimpo = processarTexto(textoColado);
+
+        const start = input.selectionStart;
+        const end = input.selectionEnd;
+        const valorAtual = input.value;
+
+        input.value = valorAtual.slice(0, start) + textoLimpo + valorAtual.slice(end);
+
+        const novaPosicao = start + textoLimpo.length;
+        input.setSelectionRange(novaPosicao, novaPosicao);
+
+        disparaEventosAngular(input);
+    }
+
+    return {
+        id: 'remover_acentos_nomes',
+        name: 'SMART BUS - Remover Acentos ao Colar (Nomes)',
+        defaultOn: true,
+        fixo: false,
+
+        init() {
+            handlePaste = tratarPaste;
+            document.addEventListener('paste', handlePaste, true);
+        },
+
+        destroy() {
+            if (handlePaste) {
+                document.removeEventListener('paste', handlePaste, true);
+                handlePaste = null;
+            }
+        }
+    };
+}
+
+registrarModulo(criarModuloRemoverAcentos());
+
+
+//================================= FIM DOS MODULOS =======================================================================
+
 
     // =========================================================================
     // PAINEL MASTER (botão + modal com checkboxes)
@@ -1471,234 +4597,217 @@
     function injetarEstilosPainel() {
         const style = document.createElement('style');
         style.id = 'tmm-painel-styles';
-        style.textContent = `
-            #tmm-fab {
-                position: fixed;
-                left: 16px;
-                bottom: 16px;
-                z-index: 2147483647;
-                width: 48px;
-                height: 48px;
-                border-radius: 50%;
-                border: none;
-                cursor: pointer;
-                background: linear-gradient(150deg, #4b5563, #1f2937);
-                color: #f3f4f6;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                box-shadow: 0 8px 22px rgba(0,0,0,0.35);
-                font-family: Arial, sans-serif;
-                transition: transform .15s ease;
-            }
+      style.textContent = `
+#tmm-fab{
+    position:fixed;
+    left:16px;
+    bottom:16px;
+    z-index:2147483647;
 
-            #tmm-fab:hover {
-                transform: translateY(-2px) scale(1.05);
-            }
+    width:42px;
+    height:42px;
 
-            #tmm-fab svg {
-                width: 22px;
-                height: 22px;
-            }
+    border-radius:50%;
+    border:1px solid #2b3b54;
 
-            #tmm-overlay {
-                position: fixed;
-                inset: 0;
-                z-index: 2147483646;
-                background: rgba(0, 0, 0, 0.45);
-                display: none;
-                align-items: center;
-                justify-content: center;
-                font-family: Arial, sans-serif;
-            }
+    background:#0f172a;
 
-            #tmm-overlay.tmm-show {
-                display: flex;
-            }
+    color:#dbeafe;
 
-            #tmm-modal {
-                width: 380px;
-                max-height: 82vh;
-                overflow: auto;
-                background: #1c1a1e;
-                border: 1px solid #322f36;
-                border-radius: 16px;
-                box-shadow: 0 20px 60px rgba(0,0,0,0.5);
-                padding: 18px;
-                color: #f3ece6;
-            }
+    display:flex;
+    align-items:center;
+    justify-content:center;
 
-            #tmm-modal-header {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                margin-bottom: 14px;
-            }
+    cursor:pointer;
 
-            #tmm-modal-title {
-                font-size: 16px;
-                font-weight: 700;
-            }
+    transition:.18s ease;
+}
 
-            #tmm-modal-close {
-                border: none;
-                background: rgba(255,255,255,0.08);
-                color: #a89d94;
-                width: 26px;
-                height: 26px;
-                border-radius: 50%;
-                cursor: pointer;
-                font-size: 15px;
-                line-height: 1;
-            }
+#tmm-fab:hover{
+    background:#162033;
+    border-color:#3b82f6;
+}
 
-            #tmm-modal-close:hover {
-                background: rgba(255,255,255,0.16);
-                color: #fff;
-            }
+#tmm-fab svg{
+    width:18px;
+    height:18px;
+}
 
-            .tmm-item {
-                display: flex;
-                align-items: center;
-                gap: 10px;
-                padding: 10px 8px;
-                border-radius: 10px;
-                border-bottom: 1px solid #2a272d;
-            }
+#tmm-overlay{
+    position:fixed;
+    inset:0;
+    z-index:2147483646;
 
-            .tmm-item:last-child {
-                border-bottom: none;
-            }
+    display:none;
+    align-items:center;
+    justify-content:center;
 
-            .tmm-item input[type="checkbox"] {
-                width: 18px;
-                height: 18px;
-                accent-color: #ff6a1f;
-                cursor: pointer;
-                flex-shrink: 0;
-            }
+    background:rgba(0,0,0,.55);
+    backdrop-filter:blur(6px);
 
-            .tmm-item label {
-                font-size: 13px;
-                cursor: pointer;
-                flex: 1;
-            }
+    font-family:Arial,sans-serif;
+}
 
-            .tmm-item-del {
-                border: none;
-                background: rgba(255,80,80,0.12);
-                color: #ff8080;
-                width: 24px;
-                height: 24px;
-                border-radius: 6px;
-                cursor: pointer;
-                font-size: 13px;
-                flex-shrink: 0;
-            }
+#tmm-overlay.tmm-show{
+    display:flex;
+}
 
-            .tmm-item-del:hover {
-                background: rgba(255,80,80,0.25);
-            }
+#tmm-modal{
 
-            #tmm-add-btn {
-                width: 100%;
-                margin-top: 14px;
-                padding: 10px;
-                background: rgba(255,106,31,0.12);
-                color: #ff6a1f;
-                border: 1px dashed #ff6a1f;
-                border-radius: 10px;
-                cursor: pointer;
-                font-size: 13px;
-                font-weight: 600;
-            }
+    width:420px;
+    max-height:82vh;
+    overflow:auto;
 
-            #tmm-add-btn:hover {
-                background: rgba(255,106,31,0.2);
-            }
+    background:#0f172a;
 
-            #tmm-add-form {
-                display: none;
-                flex-direction: column;
-                gap: 8px;
-                margin-top: 12px;
-                padding-top: 12px;
-                border-top: 1px solid #2a272d;
-            }
+    border:1px solid #233247;
 
-            #tmm-add-form.tmm-show-form {
-                display: flex;
-            }
+    border-radius:14px;
 
-            #tmm-add-form label {
-                font-size: 12px;
-                color: #a89d94;
-            }
+    color:#dbeafe;
 
-            #tmm-add-form input[type="text"],
-            #tmm-add-form textarea {
-                width: 100%;
-                box-sizing: border-box;
-                background: #100f11;
-                border: 1px solid #322f36;
-                border-radius: 8px;
-                color: #f3ece6;
-                padding: 8px;
-                font-size: 12px;
-                font-family: inherit;
-            }
+    padding:18px;
 
-            #tmm-add-form textarea {
-                font-family: 'Consolas', 'Courier New', monospace;
-                min-height: 140px;
-                resize: vertical;
-                white-space: pre;
-            }
+    box-sizing:border-box;
+}
 
-            #tmm-add-form .tmm-checkbox-linha {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-            }
+#tmm-modal::-webkit-scrollbar{
+    width:7px;
+}
 
-            #tmm-add-form .tmm-checkbox-linha input {
-                width: 16px;
-                height: 16px;
-                accent-color: #ff6a1f;
-            }
+#tmm-modal::-webkit-scrollbar-track{
+    background:transparent;
+}
 
-            .tmm-form-botoes {
-                display: flex;
-                gap: 8px;
-                margin-top: 4px;
-            }
+#tmm-modal::-webkit-scrollbar-thumb{
+    background:#2d3d55;
+    border-radius:20px;
+}
 
-            .tmm-form-botoes button {
-                flex: 1;
-                padding: 8px;
-                border-radius: 8px;
-                border: none;
-                cursor: pointer;
-                font-size: 13px;
-                font-weight: 600;
-            }
+#tmm-modal::-webkit-scrollbar-thumb:hover{
+    background:#3b82f6;
+}
 
-            #tmm-form-salvar {
-                background: #ff6a1f;
-                color: #1c1a1e;
-            }
+#tmm-modal-header{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
 
-            #tmm-form-cancelar {
-                background: rgba(255,255,255,0.08);
-                color: #a89d94;
-            }
+    margin-bottom:16px;
+}
 
-            #tmm-form-erro {
-                font-size: 12px;
-                color: #ff8080;
-                display: none;
-            }
-        `;
+#tmm-modal-title{
+
+    font-size:18px;
+    font-weight:600;
+
+    color:#ffffff;
+}
+
+#tmm-modal-close{
+
+    width:30px;
+    height:30px;
+
+    border-radius:50%;
+
+    border:1px solid #29384d;
+
+    background:transparent;
+
+    color:#94a3b8;
+
+    cursor:pointer;
+
+    transition:.18s;
+}
+
+#tmm-modal-close:hover{
+
+    background:#162033;
+
+    color:white;
+
+    border-color:#3b82f6;
+}
+
+.tmm-section-header{
+
+    font-size:11px;
+
+    font-weight:700;
+
+    color:#93c5fd;
+
+    text-transform:uppercase;
+
+    letter-spacing:.06em;
+
+    margin:14px 2px 6px;
+}
+
+.tmm-section-header:first-child{
+
+    margin-top:0;
+}
+
+.tmm-item{
+
+    display:flex;
+    align-items:center;
+
+    gap:12px;
+
+    background:#162033;
+
+    border:1px solid #1f2937;
+
+    border-radius:10px;
+
+    padding:12px;
+
+    margin-bottom:8px;
+
+    transition:.15s;
+}
+
+.tmm-item:hover{
+
+    background:#1c2b45;
+
+    border-color:#3b82f6;
+}
+
+.tmm-item:last-child{
+
+    margin-bottom:0;
+}
+
+.tmm-item input[type="checkbox"]{
+
+    width:18px;
+    height:18px;
+
+    accent-color:#3b82f6;
+
+    cursor:pointer;
+
+    flex-shrink:0;
+}
+
+.tmm-item label{
+
+    flex:1;
+
+    font-size:13px;
+
+    color:#e2e8f0;
+
+    cursor:pointer;
+
+    user-select:none;
+}
+`;
         document.head.appendChild(style);
     }
 
@@ -1708,7 +4817,17 @@
             <path d="M19.4 13.5a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.04 1.56V19.5a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.04-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.04H4.5a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.56-1.04 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H10.5a1.7 1.7 0 0 0 1.04-1.56V4.5a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1.04 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V10.5a1.7 1.7 0 0 0 1.56 1.04h.09a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.56 1.04Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
         </svg>`;
 
+    // Trava extra: mesmo que o @match esteja desatualizado em algum perfil/navegador,
+    // a engrenagem só aparece nos domínios do SmartBus (smarttravelit.com) e do Tallos
+    // (tallos.com.br), incluindo subdomínios (ex: app.tallos.com.br).
+    function dominioPermitido() {
+        const host = location.hostname;
+        return host.endsWith('smarttravelit.com') || host.endsWith('tallos.com.br');
+    }
+
     function criarPainelMaster() {
+        if (!dominioPermitido()) return;
+
         injetarEstilosPainel();
 
         const fab = document.createElement('button');
@@ -1727,42 +4846,13 @@
                     <button id="tmm-modal-close" title="Fechar" aria-label="Fechar">✕</button>
                 </div>
                 <div id="tmm-lista"></div>
-
-                <button id="tmm-add-btn">+ Adicionar novo script</button>
-
-                <div id="tmm-add-form">
-                    <label for="tmm-form-nome">Nome do script</label>
-                    <input type="text" id="tmm-form-nome" placeholder="Ex: Ocultar banners">
-
-                    <label for="tmm-form-codigo">Código (deve retornar um objeto com init() e destroy())</label>
-                    <textarea id="tmm-form-codigo" spellcheck="false" placeholder="{
-    init() {
-        // código que liga o script
-    },
-    destroy() {
-        // código que desfaz o que o init() fez
-    }
-}"></textarea>
-
-                    <div class="tmm-checkbox-linha">
-                        <input type="checkbox" id="tmm-form-auto">
-                        <label for="tmm-form-auto" style="cursor:pointer;">Ativar automaticamente ao carregar a página</label>
-                    </div>
-
-                    <div id="tmm-form-erro"></div>
-
-                    <div class="tmm-form-botoes">
-                        <button id="tmm-form-salvar">Salvar</button>
-                        <button id="tmm-form-cancelar">Cancelar</button>
-                    </div>
-                </div>
             </div>
         `;
         document.body.appendChild(overlay);
 
         const lista = overlay.querySelector('#tmm-lista');
 
-        function criarLinhaModulo(mod) {
+        function criarLinhaModulo(mod, nomeExibido) {
             const estado = carregarEstado();
             const ligado = (estado[mod.id] !== undefined) ? estado[mod.id] : mod.defaultOn;
 
@@ -1774,127 +4864,63 @@
 
             item.innerHTML = `
                 <input type="checkbox" id="${checkboxId}" ${ligado ? 'checked' : ''}>
-                <label for="${checkboxId}">${mod.name}</label>
-                ${mod.fixo ? '' : '<button class="tmm-item-del" title="Excluir">✕</button>'}
+                <label for="${checkboxId}">${nomeExibido}</label>
             `;
 
             item.querySelector('input').addEventListener('change', (e) => {
                 alternarModulo(mod.id, e.target.checked);
             });
 
-            if (!mod.fixo) {
-                item.querySelector('.tmm-item-del').addEventListener('click', () => {
-                    excluirModuloCustom(mod.id);
-                });
-            }
-
             return item;
+        }
+
+        function criarCabecalhoSecao(titulo) {
+            const header = document.createElement('div');
+            header.className = 'tmm-section-header';
+            header.textContent = titulo;
+            return header;
+        }
+
+        // Agrupa os módulos por plataforma (SmartBus / Tallos) com base no prefixo do
+        // nome. Módulos que não seguem esse padrão caem na seção "Outros".
+        function agruparModulos() {
+            const grupos = { 'SmartBus': [], 'Tallos': [], 'Outros': [] };
+
+            modulos.forEach(mod => {
+                const nomeUpper = mod.name.toUpperCase();
+
+                if (nomeUpper.startsWith('SMART BUS')) {
+                    const nomeCurto = mod.name.replace(/^SMART BUS\s*[-—]\s*/i, '');
+                    grupos['SmartBus'].push({ mod, nomeCurto });
+                } else if (nomeUpper.startsWith('TALLOS')) {
+                    const nomeCurto = mod.name.replace(/^TALLOS\s*[-—]\s*/i, '');
+                    grupos['Tallos'].push({ mod, nomeCurto });
+                } else {
+                    grupos['Outros'].push({ mod, nomeCurto: mod.name });
+                }
+            });
+
+            return grupos;
         }
 
         function renderizarLista() {
             lista.innerHTML = '';
-            modulos.forEach(mod => {
-                lista.appendChild(criarLinhaModulo(mod));
+
+            const grupos = agruparModulos();
+
+            ['SmartBus', 'Tallos', 'Outros'].forEach(secao => {
+                const itens = grupos[secao];
+                if (itens.length === 0) return;
+
+                lista.appendChild(criarCabecalhoSecao(secao));
+                itens.forEach(({ mod, nomeCurto }) => {
+                    lista.appendChild(criarLinhaModulo(mod, nomeCurto));
+                });
             });
         }
 
-        function excluirModuloCustom(id) {
-            const mod = modulos.find(m => m.id === id);
-            if (!mod || mod.fixo) return;
-
-            desligarModulo(mod);
-            removerModuloDoRegistro(id);
-
-            const estado = carregarEstado();
-            delete estado[id];
-            salvarEstado(estado);
-
-            const listaCustom = carregarScriptsCustom().filter(s => s.id !== id);
-            salvarScriptsCustom(listaCustom);
-
-            renderizarLista();
-        }
-
         renderizarLista();
-
-        // ---- botão "+" e formulário de adição ----
-        const btnAdd = overlay.querySelector('#tmm-add-btn');
-        const form = overlay.querySelector('#tmm-add-form');
-        const campoNome = overlay.querySelector('#tmm-form-nome');
-        const campoCodigo = overlay.querySelector('#tmm-form-codigo');
-        const campoAuto = overlay.querySelector('#tmm-form-auto');
-        const campoErro = overlay.querySelector('#tmm-form-erro');
-        const btnSalvar = overlay.querySelector('#tmm-form-salvar');
-        const btnCancelar = overlay.querySelector('#tmm-form-cancelar');
-
-        function limparFormulario() {
-            campoNome.value = '';
-            campoCodigo.value = '';
-            campoAuto.checked = false;
-            campoErro.style.display = 'none';
-            campoErro.textContent = '';
-        }
-
-        btnAdd.addEventListener('click', () => {
-            form.classList.toggle('tmm-show-form');
-        });
-
-        btnCancelar.addEventListener('click', () => {
-            limparFormulario();
-            form.classList.remove('tmm-show-form');
-        });
-
-        btnSalvar.addEventListener('click', () => {
-            const nome = campoNome.value.trim();
-            const codigo = campoCodigo.value.trim();
-
-            if (!nome) {
-                campoErro.textContent = 'Dê um nome para o script.';
-                campoErro.style.display = 'block';
-                return;
-            }
-            if (!codigo) {
-                campoErro.textContent = 'Cole o código do script.';
-                campoErro.style.display = 'block';
-                return;
-            }
-
-            // Testa se o código é válido e retorna um objeto com init()
-            // antes de salvar, para evitar guardar algo quebrado.
-            try {
-                const fabrica = new Function('"use strict"; return (' + codigo + ');');
-                const teste = fabrica();
-                if (!teste || typeof teste.init !== 'function') {
-                    throw new Error('O código precisa retornar um objeto com um método init().');
-                }
-            } catch (erro) {
-                campoErro.textContent = 'Código inválido: ' + erro.message;
-                campoErro.style.display = 'block';
-                return;
-            }
-
-            const novoItem = {
-                id: 'custom_' + Date.now(),
-                name: nome,
-                code: codigo,
-                ativarAuto: campoAuto.checked
-            };
-
-            const listaCustom = carregarScriptsCustom();
-            listaCustom.push(novoItem);
-            salvarScriptsCustom(listaCustom);
-
-            const novoModulo = criarModuloCustom(novoItem);
-            registrarModulo(novoModulo);
-
-            if (novoItem.ativarAuto) {
-                alternarModulo(novoModulo.id, true);
-            }
-
-            limparFormulario();
-            form.classList.remove('tmm-show-form');
-            renderizarLista();
-        });
+        atualizarCheckboxesDoPainel = renderizarLista;
 
         fab.addEventListener('click', () => {
             overlay.classList.add('tmm-show');
@@ -1917,4 +4943,4 @@
     criarPainelMaster();
     aplicarEstadoInicial();
 
-})();
+})();console.log("Hello, World!");
