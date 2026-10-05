@@ -1,0 +1,1914 @@
+// ==UserScript==
+// @name         Integração SMART BUS -> Tallos V12.6.1 (Robustez)
+// @namespace    http://tampermonkey.net/
+// @version      12.6.1
+// @description  V12.6.1: ponte por eventos (aba Tallos em 2º plano), trava entre abas, retomar fluxo, CPF mais seguro, 401 centralizado.
+// @match        https://prod-guanabara-frontoffice-smartbus.smarttravelit.com/*
+// @match        https://app.tallos.com.br/*
+// @run-at       document-start
+// @grant        GM_xmlhttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_addValueChangeListener
+// @grant        unsafeWindow
+// @connect      api.tallos.com.br
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // =========================================================
+    // CONFIGURAÇÕES
+    // =========================================================
+    const SMARTBUS_HOST = 'prod-guanabara-frontoffice-smartbus.smarttravelit.com';
+    const TALLOS_HOST = 'app.tallos.com.br';
+    const TALLOS_API = 'https://api.tallos.com.br';
+
+    // Mantido do script original enviado pelo usuário.
+    const TOKEN_API = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbXBsb3llZSI6IjY0NjUzYTczNmZlMTRiMDAxMjFiNWVhMCIsImNvbXBhbnkiOiI2NDRhOWIyZDAyMDkxYWFhYjMxNGZhZWMiLCJpYXQiOjE3NTM1NTU3NDF9.EQHoHxc01NSSluo5FeDSPQ2_FiQ4SpLOk7qJXNQr9WQ";
+
+    const ID_INTEGRACAO = 'integration-2';
+    const ID_DEPARTAMENTO = 'setor_de_vendas_87006';
+    const NOME_DEPARTAMENTO = 'Setor de vendas';
+    const TIMEZONE = 'America/Fortaleza';
+
+    const KEY_TALLOS_SESSION = 'cadastro_tallos_v11_session';
+    const KEY_TALLOS_HEARTBEAT = 'cadastro_tallos_v11_heartbeat';
+
+    // Ponte SmartBus -> aba Tallos exclusivamente para criação de contato novo.
+    // A rota interna confirmada usa a sessão/cookies da própria interface Tallos.
+    const KEY_TALLOS_CREATE_REQUEST = 'cadastro_tallos_v123_create_request';
+    const KEY_TALLOS_CREATE_RESPONSE = 'cadastro_tallos_v123_create_response';
+
+    const KEY_PANEL_POSITION = 'cadastro_tallos_v121_panel_position';
+    const KEY_PANEL_COLLAPSED = 'cadastro_tallos_v121_panel_collapsed';
+    const KEY_AGENT_SELECTED = 'cadastro_tallos_v121_agent_selected';
+
+    const KEY_TALLOS_PING = 'cadastro_tallos_v126_ping';
+    const KEY_FLOW_PROGRESS = 'cadastro_tallos_v126_flow_progress';
+
+    // Aba em segundo plano: o Chrome pode atrasar timers para 1x por minuto.
+    const HEARTBEAT_TOLERANCIA_MS = 75000;
+    const PROGRESSO_VALIDADE_MS = 2 * 60 * 60 * 1000;   // retomar fluxo por até 2h
+
+    // Identifica esta aba (trava entre várias abas da Tallos).
+    const TAB_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    // Atendentes exibidos no seletor "Operador do turno".
+    // O nome escolhido gera a tag do contato (ex.: gilmario_lima.outubro).
+    const AGENTES = Object.freeze([
+        'Aline Silva',
+        'Andre Lucas',
+        'Bezalel Barbosa',
+        'Cayo Mendes',
+        'Clerves Oliveira',
+        'Daniel Lima',
+        'Eduarda Lima',
+        'Felipe Sombra',
+        'Gilmario Lima',
+        'Gleison Castro',
+        'Guilherme Moura',
+        'João Pedro',
+        'Joel Lima',
+        'Kaio Leão',
+        'Leopoldo Silva',
+        'Manoel William',
+        'Marcelo Santos',
+        'Pedro Santos',
+        'Uelisson Torres'
+    ]);
+
+    // Template capturado do payload real da Tallos (envio manual, 201 Created).
+    const TEMPLATE = Object.freeze({
+        label: 'Falha de transação',
+        id: '6ac3e3f24ae77a1e2baa1706',
+        idSync: '19417305-7565-404d-8e8b-ae465b4abb9c',
+        nameSync: '1',
+        type: 'buttons',
+        preview: 'Guanabara\nOlá, @SALDACAO.\n\nSomos do Suporte Online do Grupo Guanabara.\n\nIdentificamos que uma transação não foi aprovada em nosso sistema.\n\nCaso precise de suporte relacionado a essa transação, selecione uma opção abaixo. | [Solicitar suporte] | [Não preciso]',
+        params: [{ match: '{{1}}', type: 'BUTTONS', BUTTONS: '@SALDACAO', visible: true }],
+        buttons: [
+            { type: 'QUICK_REPLY', text: 'Solicitar suporte' },
+            { type: 'QUICK_REPLY', text: 'Não preciso' }
+        ]
+    });
+
+    let fluxoEmAndamento = false;
+    let etapaAtual = 0;
+
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const digits = value => String(value ?? '').replace(/\D/g, '');
+
+    function parseJSON(text) {
+        try { return JSON.parse(String(text || '')); } catch { return null; }
+    }
+
+    // =========================================================
+    // SESSÃO TALLOS
+    // O mesmo userscript roda em app.tallos.com.br e salva a
+    // sessão autenticada para a aba do SmartBus.
+    // =========================================================
+    function decodeJWT(token) {
+        try {
+            const parts = String(token || '').split('.');
+            if (parts.length !== 3) return null;
+            let base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+            while (base64.length % 4) base64 += '=';
+            const binary = atob(base64);
+            const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+            return JSON.parse(new TextDecoder('utf-8').decode(bytes));
+        } catch {
+            return null;
+        }
+    }
+
+    function extrairBearer(value) {
+        return String(value || '').trim().replace(/^Bearer\s+/i, '').trim();
+    }
+
+    function salvarSessaoTallos(authorization, source = 'request') {
+        const token = extrairBearer(authorization);
+        const payload = decodeJWT(token);
+        if (!payload) return false;
+
+        const employeeId = payload.employeeId || payload.employee_id || payload.employee;
+        const companyId = payload.companyId || payload.company_id || payload.company;
+        if (!employeeId || !companyId) return false;
+        if (payload.exp && Number(payload.exp) * 1000 <= Date.now()) return false;
+
+        GM_setValue(KEY_TALLOS_SESSION, {
+            token,
+            employeeId: String(employeeId),
+            companyId: String(companyId),
+            email: String(payload.employeeEmail || payload.employee_email || payload.email || ''),
+            exp: payload.exp || null,
+            capturedAt: Date.now(),
+            source
+        });
+        return true;
+    }
+
+    function getSessaoTallos() {
+        const session = GM_getValue(KEY_TALLOS_SESSION, null);
+        if (!session?.token || !session?.employeeId) return null;
+        const payload = decodeJWT(session.token);
+        const exp = Number(session.exp || payload?.exp || 0);
+        if (exp && exp * 1000 <= Date.now() + 60000) return null;
+        return session;
+    }
+
+    function extrairAuthorization(headers) {
+        if (!headers) return '';
+        try {
+            if (typeof headers.get === 'function') {
+                return headers.get('Authorization') || headers.get('authorization') || '';
+            }
+            if (Array.isArray(headers)) {
+                const found = headers.find(([name]) => String(name).toLowerCase() === 'authorization');
+                return found?.[1] || '';
+            }
+            if (typeof headers === 'object') {
+                const key = Object.keys(headers).find(name => name.toLowerCase() === 'authorization');
+                return key ? headers[key] : '';
+            }
+        } catch {}
+        return '';
+    }
+
+    function procurarJWTs(text) {
+        return typeof text === 'string'
+            ? (text.match(/eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g) || [])
+            : [];
+    }
+
+    function scanStorage(storage, source) {
+        try {
+            for (let i = 0; i < storage.length; i++) {
+                const key = storage.key(i);
+                const value = storage.getItem(key);
+                for (const token of procurarJWTs(value)) {
+                    if (salvarSessaoTallos(token, `${source}:${key}`)) return true;
+                }
+            }
+        } catch {}
+        return false;
+    }
+
+    function instalarCapturaFetchTallos() {
+        try {
+            const w = unsafeWindow;
+            if (!w?.fetch || w.fetch.__cadastroTallosV11) return;
+            const original = w.fetch;
+            const wrapped = async function(...args) {
+                try {
+                    const input = args[0];
+                    const init = args[1] || {};
+                    let auth = extrairAuthorization(init.headers);
+                    if (!auth && input?.headers) auth = extrairAuthorization(input.headers);
+                    if (auth) salvarSessaoTallos(auth, 'fetch');
+                } catch {}
+                return original.apply(this, args);
+            };
+            wrapped.__cadastroTallosV11 = true;
+            w.fetch = wrapped;
+        } catch {}
+    }
+
+    function instalarCapturaXHRTallos() {
+        try {
+            const proto = unsafeWindow?.XMLHttpRequest?.prototype;
+            if (!proto || proto.__cadastroTallosV11) return;
+            const originalSet = proto.setRequestHeader;
+            proto.setRequestHeader = function(name, value) {
+                try {
+                    if (String(name).toLowerCase() === 'authorization') {
+                        salvarSessaoTallos(value, 'xhr');
+                    }
+                } catch {}
+                return originalSet.call(this, name, value);
+            };
+            proto.__cadastroTallosV11 = true;
+        } catch {}
+    }
+
+    // =========================================================
+    // PONTE DE CADASTRO NOVO — EXECUTADA NA ABA DA TALLOS
+    // =========================================================
+    function payloadCadastroInternoTallos(dados, session) {
+        return {
+            custom_fields: [],
+            customizable_field: [],
+            data_protection: [],
+            full_name: String(dados?.nome || '').trim(),
+            cel_phone: digits(dados?.telefone || ''),
+            address: {
+                street: '',
+                complement: '',
+                district: '',
+                country: ''
+            },
+            job: {
+                title: '',
+                department: '',
+                company: '',
+                phone: '',
+                site: '',
+                occupation_area: ''
+            },
+            employee: String(session?.employeeId || ''),
+            timezone: TIMEZONE,
+            whatsapp_integration: ID_INTEGRACAO,
+            selected_tags: [],
+            birth_date: null,
+            contact_origin: {
+                origin: 'manual',
+                channel: 'rd_conversas'
+            },
+            broker: 'gupshup',
+            current_wallet: null
+        };
+    }
+
+    async function tallosFetchInternoCadastro(url, payload, token, timeout = 10000) {
+        const controller =
+            typeof AbortController !== 'undefined'
+                ? new AbortController()
+                : null;
+
+        const timer = controller
+            ? setTimeout(() => controller.abort(), timeout)
+            : null;
+
+        try {
+            const response = await unsafeWindow.fetch(url, {
+                method: 'POST',
+                credentials: 'include',
+                headers: {
+                    'Accept': 'application/json, text/plain, */*',
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`
+                },
+                body: JSON.stringify(payload),
+                signal: controller?.signal
+            });
+
+            const responseText = await response.text();
+
+            return {
+                status: Number(response.status || 0),
+                responseText
+            };
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
+    }
+
+    let tallosCreateBridgeBusy = false;
+    let tallosCreateBridgeLastId = '';
+
+    async function processarPonteCadastroNovo() {
+        if (tallosCreateBridgeBusy) return;
+
+        const request = GM_getValue(KEY_TALLOS_CREATE_REQUEST, null);
+
+        if (
+            !request?.id ||
+            request.state !== 'PENDING' ||
+            String(request.id) === String(tallosCreateBridgeLastId)
+        ) {
+            return;
+        }
+
+        // Não executa pedidos muito antigos depois de reload/reabertura.
+        const createdAt = Number(request.createdAt || 0);
+        if (!createdAt || Date.now() - createdAt > 30000) {
+            GM_setValue(KEY_TALLOS_CREATE_RESPONSE, {
+                id: String(request.id),
+                ok: false,
+                status: 0,
+                error: 'PEDIDO_DE_CADASTRO_EXPIRADO',
+                respondedAt: Date.now()
+            });
+            GM_setValue(KEY_TALLOS_CREATE_REQUEST, null);
+            return;
+        }
+
+        const session = getSessaoTallos();
+        if (!session?.employeeId || !session?.companyId) {
+            GM_setValue(KEY_TALLOS_CREATE_RESPONSE, {
+                id: String(request.id),
+                ok: false,
+                status: 0,
+                error: 'SESSAO_TALLOS_SEM_OPERADOR_OU_EMPRESA',
+                respondedAt: Date.now()
+            });
+            GM_setValue(KEY_TALLOS_CREATE_REQUEST, null);
+            return;
+        }
+
+        const dados = {
+            nome: String(request?.dados?.nome || '').trim(),
+            telefone: digits(request?.dados?.telefone || '')
+        };
+
+        if (!dados.nome || !telefoneValido(dados.telefone)) {
+            GM_setValue(KEY_TALLOS_CREATE_RESPONSE, {
+                id: String(request.id),
+                ok: false,
+                status: 0,
+                error: 'DADOS_INVALIDOS_PARA_CADASTRO_INTERNO',
+                respondedAt: Date.now()
+            });
+            GM_setValue(KEY_TALLOS_CREATE_REQUEST, null);
+            return;
+        }
+
+        tallosCreateBridgeBusy = true;
+        tallosCreateBridgeLastId = String(request.id);
+
+        // Trava entre abas: cada aba da Tallos tenta assumir o pedido e só
+        // segue quem continuar como dona depois de um pequeno intervalo.
+        GM_setValue(KEY_TALLOS_CREATE_REQUEST, {
+            ...request,
+            state: 'CLAIMED',
+            owner: TAB_ID,
+            claimedAt: Date.now()
+        });
+
+        await sleep(200);
+
+        const claimed = GM_getValue(KEY_TALLOS_CREATE_REQUEST, null);
+        if (!claimed || String(claimed.id) !== String(request.id) || claimed.owner !== TAB_ID) {
+            tallosCreateBridgeBusy = false;
+            return; // outra aba da Tallos assumiu este pedido
+        }
+
+        // Marca como SENDING antes da escrita. Se a aba recarregar depois daqui,
+        // não há reenvio automático da mesma ocorrência.
+        GM_setValue(KEY_TALLOS_CREATE_REQUEST, {
+            ...claimed,
+            state: 'SENDING',
+            sendingAt: Date.now()
+        });
+
+        try {
+            const url =
+                `${TALLOS_API}/megasac-api/whatsapp-official/create/` +
+                `${encodeURIComponent(session.companyId)}`;
+
+            const payload =
+                payloadCadastroInternoTallos(dados, session);
+
+            const result =
+                await tallosFetchInternoCadastro(
+                    url,
+                    payload,
+                    session.token,
+                    10000
+                );
+
+            GM_setValue(KEY_TALLOS_CREATE_RESPONSE, {
+                id: String(request.id),
+                ok:
+                    result.status >= 200 &&
+                    result.status < 300,
+                status: result.status,
+                responseText: String(result.responseText || ''),
+                respondedAt: Date.now()
+            });
+        } catch (error) {
+            GM_setValue(KEY_TALLOS_CREATE_RESPONSE, {
+                id: String(request.id),
+                ok: false,
+                status: 0,
+                error:
+                    error?.name === 'AbortError'
+                        ? 'TIMEOUT_CADASTRO_INTERNO_TALLOS'
+                        : String(error?.message || error || 'ERRO_CADASTRO_INTERNO_TALLOS'),
+                respondedAt: Date.now()
+            });
+        } finally {
+            GM_setValue(KEY_TALLOS_CREATE_REQUEST, null);
+            tallosCreateBridgeBusy = false;
+        }
+    }
+
+    function iniciarPonteTallos() {
+        const install = () => {
+            instalarCapturaFetchTallos();
+            instalarCapturaXHRTallos();
+        };
+        const scan = () => {
+            try {
+                scanStorage(unsafeWindow.localStorage, 'localStorage');
+                scanStorage(unsafeWindow.sessionStorage, 'sessionStorage');
+            } catch {}
+        };
+        const heartbeat = () => GM_setValue(KEY_TALLOS_HEARTBEAT, Date.now());
+
+        install();
+        scan();
+        heartbeat();
+        setInterval(install, 1500);
+        setInterval(scan, 30000);
+        setInterval(heartbeat, 5000);
+
+        // Eventos em vez de polling: continuam funcionando com a aba da Tallos
+        // em segundo plano, onde o navegador atrasa setInterval.
+        GM_addValueChangeListener(KEY_TALLOS_CREATE_REQUEST, (name, oldValue, newValue) => {
+            if (newValue?.state === 'PENDING') processarPonteCadastroNovo();
+        });
+        GM_addValueChangeListener(KEY_TALLOS_PING, () => heartbeat());
+
+        // Varredura de reserva, caso algum evento se perca.
+        processarPonteCadastroNovo();
+        setInterval(processarPonteCadastroNovo, 2000);
+
+        console.info('[Tallos V12.6.1] Ponte de sessão + cadastro interno autenticado ativa.');
+    }
+
+    function tallosConectada() {
+        const hb = Number(GM_getValue(KEY_TALLOS_HEARTBEAT, 0));
+        return Boolean(hb && Date.now() - hb < HEARTBEAT_TOLERANCIA_MS && getSessaoTallos());
+    }
+
+    // Confirma na hora que existe uma aba da Tallos respondendo
+    // (a aba responde ao ping por evento, mesmo em segundo plano).
+    async function pingTallos(timeout = 3000) {
+        const sentAt = Date.now();
+        GM_setValue(KEY_TALLOS_PING, sentAt);
+        const deadline = sentAt + timeout;
+        while (Date.now() < deadline) {
+            if (Number(GM_getValue(KEY_TALLOS_HEARTBEAT, 0)) >= sentAt) return true;
+            await sleep(100);
+        }
+        return false;
+    }
+
+    // =========================================================
+    // REQUISIÇÕES TALLOS
+    // =========================================================
+    function requestTallos({ method = 'GET', url, token, data = null, timeout = 15000 }) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method,
+                url,
+                headers: {
+                    'Accept': 'application/json, text/plain, */*',
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`
+                },
+                data: data == null ? undefined : JSON.stringify(data),
+                timeout,
+                onload: resolve,
+                onerror: err => reject(new Error(`Falha de conexão Tallos: ${err?.error || 'erro de rede'}`)),
+                ontimeout: () => reject(new Error('Timeout na Tallos.'))
+            });
+        });
+    }
+
+    function requestPublico(options) {
+        return requestTallos({ ...options, token: TOKEN_API });
+    }
+
+    async function requestSessao(options) {
+        const session = getSessaoTallos();
+        if (!session) throw new Error('SESSAO_TALLOS_INDISPONIVEL');
+
+        const response = await requestTallos({ ...options, token: session.token });
+        const status = Number(response?.status || 0);
+
+        if (status === 401) {
+            // Sessão vencida: descarta para a aba da Tallos capturar uma nova.
+            GM_setValue(KEY_TALLOS_SESSION, null);
+            throw new Error('SESSAO_TALLOS_EXPIRADA_HTTP_401 (recarregue a aba da Tallos)');
+        }
+        if (status === 403) {
+            throw new Error('SEM_PERMISSAO_TALLOS_HTTP_403');
+        }
+        return response;
+    }
+
+    // Diagnóstico do token fixo: verifica se /v2/contacts aceita o token da sessão.
+    // No console da aba do SmartBus: await __tallosTestarTokenSessao()
+    async function testarTokenSessaoContatos(telefone = '5585900000000') {
+        const session = getSessaoTallos();
+        if (!session) return 'Sem sessão Tallos capturada. Abra a Tallos e tente de novo.';
+
+        const response = await requestTallos({
+            method: 'GET',
+            url: `${TALLOS_API}/v2/contacts/${encodeURIComponent(digits(telefone))}/exists`,
+            token: session.token,
+            timeout: 7000
+        });
+
+        const status = Number(response?.status || 0);
+        const aceito = status > 0 && status !== 401 && status !== 403;
+        const msg = aceito
+            ? `Token da sessão ACEITO em /v2/contacts (HTTP ${status}).`
+            : `Token da sessão RECUSADO em /v2/contacts (HTTP ${status}). O TOKEN_API continua necessário.`;
+        console.info('[Tallos V12.6.1]', msg);
+        return msg;
+    }
+
+    // =========================================================
+    // DADOS SMARTBUS
+    // =========================================================
+    function gerarTag(nomeAgente) {
+        const meses = ['janeiro','fevereiro','marco','abril','maio','junho','julho','agosto','setembro','outubro','novembro','dezembro'];
+        const mesAtual = meses[new Date().getMonth()];
+        return nomeAgente.normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .toLowerCase()
+            .replace(/\s+/g, '_') + '.' + mesAtual;
+    }
+
+    function validarCPF(cpfStr) {
+        let cpf = digits(cpfStr);
+        if (cpf.length !== 11 || /^(\d)\1{10}$/.test(cpf)) return false;
+        let sum = 0, rest;
+        for (let i = 1; i <= 9; i++) sum += parseInt(cpf.substring(i-1, i)) * (11 - i);
+        rest = (sum * 10) % 11;
+        if (rest === 10 || rest === 11) rest = 0;
+        if (rest !== parseInt(cpf.substring(9, 10))) return false;
+        sum = 0;
+        for (let i = 1; i <= 10; i++) sum += parseInt(cpf.substring(i-1, i)) * (12 - i);
+        rest = (sum * 10) % 11;
+        if (rest === 10 || rest === 11) rest = 0;
+        return rest === parseInt(cpf.substring(10, 11));
+    }
+
+    // Procura o CPF só nos cartões do cupom (passageiro primeiro), nunca no
+    // bloco do emissor. Prioriza o número rotulado como "CPF" e ignora o telefone.
+    function capturarCPF(telefone) {
+        const telNacional = digits(telefone).replace(/^55(?=\d{10,11}$)/, '');
+        const areas = Array.from(document.querySelectorAll('.card-coupon-area'));
+        const passageiro = areas[1];
+        const ordem = passageiro ? [passageiro, ...areas.filter(a => a !== passageiro)] : areas;
+
+        for (const area of ordem) {
+            const rotulado = (area.innerText || '').match(/CPF[^\d]{0,20}(\d{3}\.?\d{3}\.?\d{3}-?\d{2})/i);
+            if (rotulado && validarCPF(rotulado[1])) return digits(rotulado[1]);
+        }
+
+        for (const area of ordem) {
+            const possiveis = (area.innerText || '').match(/\b\d{11}\b|\b\d{3}\.\d{3}\.\d{3}-\d{2}\b/g) || [];
+            for (const candidato of possiveis) {
+                const d = digits(candidato);
+                if (d === telNacional) continue;
+                if (validarCPF(d)) return d;
+            }
+        }
+
+        return ''; // sem CPF é melhor do que CPF de outra pessoa
+    }
+
+    function capturarDados() {
+        try {
+            const nomeRaw = document.querySelectorAll('.card-coupon-area')[1]?.querySelectorAll('td')[1]?.textContent;
+            const nome = nomeRaw
+                ? nomeRaw.trim().toLowerCase().replace(/(?:^|\s)\S/g, a => a.toUpperCase())
+                : 'Passageiro';
+
+            const locRaw = document.querySelectorAll('.coupon-summary-value')[1]?.textContent;
+            const localizador = locRaw ? locRaw.trim() : 'Desconhecido';
+
+            let telBruto = document.querySelectorAll('.card-coupon-area')[1]?.querySelectorAll('td')[4]?.textContent;
+            if (
+                document.querySelectorAll('.coupon-issuer-info').length === 2 &&
+                document.querySelectorAll('.coupon-issuer-info')[1].querySelectorAll('label')[4]?.textContent === 'Telefone'
+            ) {
+                telBruto = document.querySelectorAll('.coupon-issuer-info')[1].querySelectorAll('.lbl-value')[2]?.textContent || telBruto;
+            }
+
+            let telefone = digits(telBruto);
+            if (telefone.length === 10 || telefone.length === 11) telefone = '55' + telefone;
+
+            const cpf = capturarCPF(telefone);
+
+            const faltando = [];
+            if (!nomeRaw || !nomeRaw.trim()) faltando.push('nome');
+            if (!locRaw || !locRaw.trim()) faltando.push('localizador');
+
+            return { nome, telefone, cpf, localizador, faltando };
+        } catch (error) {
+            console.error('[Tallos V12] Captura:', error);
+            return null;
+        }
+    }
+
+    function normalizarTelefoneManual(value) {
+        let number = digits(value);
+        if (!number.startsWith('55') && (number.length === 10 || number.length === 11)) number = '55' + number;
+        return number;
+    }
+
+    function telefoneValido(value) {
+        const d = digits(value);
+        return d.length >= 10 && d.length <= 13;
+    }
+
+    function variantesTelefone(phone) {
+        const number = digits(phone);
+        if (!telefoneValido(number)) return [];
+        const variants = [number];
+        let national = number;
+
+        if (number.startsWith('55') && (number.length === 12 || number.length === 13)) {
+            national = number.slice(2);
+        }
+        if (national.length === 10 || national.length === 11) {
+            variants.push(national, '55' + national);
+            if (national.length === 11 && national[2] === '9') {
+                const semNove = national.slice(0, 2) + national.slice(3);
+                variants.push(semNove, '55' + semNove);
+            } else if (national.length === 10) {
+                const comNove = national.slice(0, 2) + '9' + national.slice(2);
+                variants.push(comNove, '55' + comNove);
+            }
+        }
+        return [...new Set(variants.filter(telefoneValido))];
+    }
+
+    // =========================================================
+    // CONTATO: LOCALIZAR / CRIAR / ATUALIZAR
+    // =========================================================
+    function contactFromJSON(json) {
+        return json?.data || json?.contact || json?.customer || json;
+    }
+
+    function customerIdFrom(contact, json = null) {
+        return String(
+            contact?._id || contact?.id || contact?.customerId || contact?.customer_id ||
+            json?.customerId || json?.data?.customerId || ''
+        );
+    }
+
+    async function lookupExato(phone) {
+        const number = digits(phone);
+        const response = await requestPublico({
+            method: 'GET',
+            url: `${TALLOS_API}/v2/contacts/${encodeURIComponent(number)}/exists`,
+            timeout: 7000
+        });
+
+        const json = parseJSON(response.responseText);
+        if (
+            response.status === 404 ||
+            response.status === 204 ||
+            (response.status === 200 && (json?.exists === false || json?.data?.exists === false))
+        ) {
+            return { exists: false, id: '', contact: null, matchedPhone: number };
+        }
+        if (response.status !== 200) throw new Error(`LOOKUP_HTTP_${response.status}`);
+
+        const contact = contactFromJSON(json);
+        const id = customerIdFrom(contact, json);
+        if (!id) throw new Error('CONTATO_EXISTE_SEM_CUSTOMER_ID');
+
+        return {
+            exists: true,
+            id,
+            contact,
+            matchedPhone: digits(contact?.cel_phone || contact?.phone || number)
+        };
+    }
+
+    async function localizarContato(phone) {
+        const variants = variantesTelefone(phone);
+        const results = await Promise.all(
+            variants.map(number =>
+                lookupExato(number).catch(error => ({ error, exists: false, requestedPhone: number }))
+            )
+        );
+
+        const hardError = results.find(item => item.error);
+        if (hardError) throw hardError.error;
+
+        const encontrados = results.filter(item => item.exists && item.id);
+        const porId = new Map(encontrados.map(item => [String(item.id), item]));
+        if (porId.size > 1) throw new Error('VARIANTES_DO_TELEFONE_APONTAM_PARA_CONTATOS_DIFERENTES');
+
+        return [...porId.values()][0] || { exists: false, id: '', contact: null, matchedPhone: digits(phone) };
+    }
+
+    function tagsExistentes(contact) {
+        if (!Array.isArray(contact?.tags)) return [];
+        return contact.tags
+            .map(tag => typeof tag === 'string' ? tag : tag?.name)
+            .filter(tag => typeof tag === 'string' && tag.trim());
+    }
+
+    function payloadContato(dados, phone, tag, novo, existingContact = null) {
+        const tags = novo
+            ? [tag]
+            : [...new Set([...tagsExistentes(existingContact), tag])];
+
+        const payload = {
+            full_name: dados.nome,
+            cel_phone: digits(phone),
+            integration: ID_INTEGRACAO,
+            description: `Passageiro exportado. Localizador: ${dados.localizador}`,
+            code: dados.localizador,
+            tags
+        };
+        if (novo) payload.department_name = ID_DEPARTAMENTO;
+        if (dados.cpf) payload.cpf = dados.cpf;
+        return payload;
+    }
+
+    async function atualizarContato(dados, phone, tag, contact) {
+        const response = await requestPublico({
+            method: 'PUT',
+            url: `${TALLOS_API}/v2/contacts/whatsapp-business-by-brokers`,
+            data: payloadContato(dados, phone, tag, false, contact),
+            timeout: 10000
+        });
+        if (![200, 204].includes(Number(response.status))) {
+            throw new Error(`ATUALIZAR_CONTATO_HTTP_${response.status}`);
+        }
+        return response;
+    }
+
+    function criarIdPonteCadastro() {
+        return (
+            `${Date.now()}-` +
+            `${Math.random().toString(36).slice(2, 10)}`
+        );
+    }
+
+    async function criarContato(dados, tag) {
+        const session = getSessaoTallos();
+
+        if (!session?.employeeId || !session?.companyId) {
+            throw new Error('SESSAO_TALLOS_SEM_OPERADOR_OU_EMPRESA');
+        }
+
+        const requestId =
+            criarIdPonteCadastro();
+
+        // Limpa somente uma resposta antiga antes de publicar a nova solicitação.
+        GM_setValue(KEY_TALLOS_CREATE_RESPONSE, null);
+
+        GM_setValue(KEY_TALLOS_CREATE_REQUEST, {
+            id: requestId,
+            state: 'PENDING',
+            createdAt: Date.now(),
+            dados: {
+                nome: String(dados?.nome || '').trim(),
+                telefone: digits(dados?.telefone || '')
+            }
+        });
+
+        const deadline =
+            Date.now() + 12000;
+
+        while (Date.now() < deadline) {
+            await sleep(100);
+
+            const response =
+                GM_getValue(
+                    KEY_TALLOS_CREATE_RESPONSE,
+                    null
+                );
+
+            if (
+                !response ||
+                String(response.id || '') !== requestId
+            ) {
+                continue;
+            }
+
+            GM_setValue(
+                KEY_TALLOS_CREATE_RESPONSE,
+                null
+            );
+
+            if (!response.ok) {
+                if (Number(response.status || 0)) {
+                    throw new Error(
+                        `CRIAR_CONTATO_INTERNO_HTTP_${response.status}`
+                    );
+                }
+
+                throw new Error(
+                    String(
+                        response.error ||
+                        'CRIAR_CONTATO_INTERNO_FALHOU'
+                    )
+                );
+            }
+
+            return {
+                status: Number(response.status || 0),
+                responseText: String(response.responseText || '')
+            };
+        }
+
+        // Não repete automaticamente: o próximo clique começa fazendo lookup.
+        // Se a criação tiver concluído na Tallos mas a resposta se perdeu,
+        // o contato será encontrado e reconciliado na próxima tentativa.
+        throw new Error('CRIAR_CONTATO_INTERNO_SEM_CONFIRMACAO');
+    }
+
+    async function garantirContato(dados, tag) {
+        let lookup = await localizarContato(dados.telefone);
+
+        if (lookup.exists) {
+            const phone = digits(lookup.matchedPhone || dados.telefone);
+            await atualizarContato(dados, phone, tag, lookup.contact);
+            return {
+                customerId: String(lookup.id),
+                phone,
+                action: 'CONTATO_EXISTENTE_ATUALIZADO'
+            };
+        }
+
+        const created = await criarContato(dados, tag);
+        const status = Number(created.status || 0);
+
+        if ([200, 201].includes(status)) {
+            const json = parseJSON(created.responseText);
+            const createdContact = contactFromJSON(json);
+            let customerId = customerIdFrom(createdContact, json);
+
+            // A rota interna normalmente devolve o contato criado completo.
+            // Se não devolver ID, confirma pelo lookup já existente.
+            if (!customerId) {
+                lookup = await localizarContato(dados.telefone);
+                customerId = String(lookup.id || '');
+            }
+
+            if (!customerId) {
+                throw new Error('CONTATO_CRIADO_SEM_CUSTOMER_ID');
+            }
+
+            // A criação manual da Tallos não leva nossas tags/localizador/CPF.
+            // Reutiliza o PUT que já funcionava para contatos existentes,
+            // agora apenas para complementar o contato recém-criado.
+            const phone = digits(
+                lookup?.matchedPhone ||
+                createdContact?.cel_phone ||
+                createdContact?.celPhone ||
+                dados.telefone
+            );
+
+            await atualizarContato(
+                dados,
+                phone,
+                tag,
+                lookup?.contact || createdContact
+            );
+
+            return {
+                customerId,
+                phone,
+                action: 'CONTATO_NOVO_CRIADO_VIA_TALLOS'
+            };
+        }
+
+        if ([400, 409].includes(status)) {
+            // Pode ter sido criado por outra ação entre o lookup e o POST.
+            lookup = await localizarContato(dados.telefone);
+            if (!lookup.exists || !lookup.id) throw new Error(`CONFLITO_CRIACAO_HTTP_${status}_SEM_CONTATO`);
+
+            const phone = digits(lookup.matchedPhone || dados.telefone);
+            await atualizarContato(dados, phone, tag, lookup.contact);
+            return {
+                customerId: String(lookup.id),
+                phone,
+                action: 'CONTATO_EXISTENTE_RECONCILIADO'
+            };
+        }
+
+        throw new Error(`CRIAR_CONTATO_HTTP_${status}`);
+    }
+
+    // =========================================================
+    // ATENDIMENTO /START
+    // =========================================================
+    function queueCustomerId(item) {
+        const customer = item?.customer || item?.contact || item?.client || item?.cliente;
+        if (typeof customer === 'string') return customer;
+        if (customer && typeof customer === 'object') {
+            return String(customer._id || customer.id || customer.customerId || customer.customer_id || '');
+        }
+        return String(item?.customer_id || item?.customerId || '');
+    }
+
+    function queuePhone(item) {
+        const customer = item?.customer && typeof item.customer === 'object'
+            ? item.customer
+            : (item?.contact && typeof item.contact === 'object' ? item.contact : item);
+        return digits(customer?.cel_phone || customer?.phone || customer?.telefone || item?.cel_phone || item?.phone || '');
+    }
+
+    function queueDocs(json) {
+        const candidates = [
+            json, json?.data, json?.docs, json?.items, json?.results,
+            json?.data?.docs, json?.data?.items, json?.data?.results
+        ];
+        const docs = candidates.find(Array.isArray) || [];
+        const rawPages = json?.pages ?? json?.totalPages ?? json?.data?.pages ?? json?.data?.totalPages;
+        const pages = Math.max(1, Number(rawPages == null ? 1 : rawPages) || 1);
+        return { docs, pages };
+    }
+
+    function queueMatch(item, customerId, phone) {
+        const itemId = queueCustomerId(item);
+        if (customerId && itemId) return String(customerId) === String(itemId);
+        const itemPhone = queuePhone(item);
+        return Boolean(digits(phone) && itemPhone && digits(phone) === itemPhone);
+    }
+
+    async function consultarFila(queueName, customerId, phone, deadline = Date.now() + 5000) {
+        let pages = 1;
+        for (let page = 1; page <= Math.min(pages, 2); page++) {
+            if (Date.now() >= deadline) return { ok: false, found: false, reason: 'TIMEOUT_FILA' };
+
+            const channels = JSON.stringify({ channel: 'all', integration: 'all' });
+            const params = new URLSearchParams({
+                department: '',
+                search: '',
+                onlyUnreadMessages: 'false',
+                channels,
+                sortLast: 'desc',
+                page: String(page),
+                limit: '100'
+            });
+
+            const response = await requestSessao({
+                method: 'GET',
+                url: `${TALLOS_API}/chat/calls/queues/${encodeURIComponent(queueName)}?${params.toString()}`,
+                timeout: Math.max(1, deadline - Date.now())
+            });
+
+            if (response.status !== 200) return { ok: false, found: false, reason: `FILA_HTTP_${response.status}` };
+
+            const parsed = queueDocs(parseJSON(response.responseText));
+            pages = Math.max(pages, parsed.pages);
+            const found = parsed.docs.find(item => queueMatch(item, customerId, phone));
+            if (found) return { ok: true, found: true, item: found };
+        }
+        return { ok: true, found: false };
+    }
+
+    function activeEvidence(item) {
+        return {
+            callId: String(item?.current_call?._id || item?.current_call?.id || item?.current_call || ''),
+            employeeId: String(item?.on_call_by?._id || item?.on_call_by?.id || item?.on_call_by || '')
+        };
+    }
+
+    async function confirmarActive(customerId, phone) {
+        const deadline = Date.now() + 5000;
+        const session = getSessaoTallos();
+
+        for (let attempt = 1; attempt <= 4; attempt++) {
+            const active = await consultarFila('queue_calls', customerId, phone, deadline);
+            if (!active.ok) return { confirmed: false, reason: active.reason };
+            if (active.found) {
+                const evidence = activeEvidence(active.item);
+                if (evidence.callId && evidence.employeeId === String(session?.employeeId || '')) {
+                    return { confirmed: true, ...evidence };
+                }
+                return { confirmed: false, reason: 'ATENDIMENTO_DE_OUTRO_OPERADOR' };
+            }
+            if (attempt < 4) await sleep(250);
+        }
+        return { confirmed: false, reason: 'ACTIVE_NAO_CONFIRMADO' };
+    }
+
+    function startEvidence(response, customerId) {
+        const status = Number(response?.status || 0);
+        if (status < 200 || status >= 300) return { valid: false };
+
+        const json = parseJSON(response.responseText);
+        const call = json?.data?.call || json?.call || json?.data || json;
+        const callId = String(call?._id || call?.id || '');
+        const responseCustomerId = String(
+            call?.customer?._id || call?.customer?.id || call?.customer ||
+            json?.customer?._id || json?.customer?.id || json?.customer || ''
+        );
+        const owner = String(call?.employee?._id || call?.employee?.id || call?.employee || '');
+        const sameOwner = !owner || owner === String(getSessaoTallos()?.employeeId || '');
+
+        return {
+            valid: Boolean(callId && responseCustomerId === String(customerId) && sameOwner && call?.closed === false),
+            callId
+        };
+    }
+
+    async function iniciarAtendimento(customerId, phone) {
+        const session = getSessaoTallos();
+        if (!session?.employeeId) throw new Error('SESSAO_TALLOS_SEM_OPERADOR');
+
+        // Não interfere em cliente que já está esperando ou já possui atendimento.
+        const waiting = await consultarFila('queue_await', customerId, phone, Date.now() + 4000);
+        if (!waiting.ok) throw new Error(waiting.reason);
+        if (waiting.found) throw new Error('CLIENTE_JA_ESTA_NA_FILA_TALLOS');
+
+        const activeBefore = await consultarFila('queue_calls', customerId, phone, Date.now() + 4000);
+        if (!activeBefore.ok) throw new Error(activeBefore.reason);
+        if (activeBefore.found) throw new Error('CLIENTE_JA_POSSUI_ATENDIMENTO_ATIVO');
+
+        const params = new URLSearchParams({
+            employee: String(session.employeeId),
+            timezone: TIMEZONE,
+            department: ID_DEPARTAMENTO
+        });
+
+        const response = await requestSessao({
+            method: 'GET',
+            url: `${TALLOS_API}/calls/from/customer/${encodeURIComponent(customerId)}/start?${params.toString()}`,
+            timeout: 10000
+        });
+
+        const status = Number(response.status || 0);
+        if (status === 401 || status === 403) {
+            GM_setValue(KEY_TALLOS_SESSION, null);
+            throw new Error(`SESSAO_TALLOS_EXPIRADA_HTTP_${status}`);
+        }
+        if (status < 200 || status >= 300) {
+            throw new Error(`START_HTTP_${status}`);
+        }
+
+        const evidence = startEvidence(response, customerId);
+        if (evidence.valid) return { confirmed: true, callId: evidence.callId };
+
+        const active = await confirmarActive(customerId, phone);
+        if (!active.confirmed) throw new Error(active.reason || 'START_NAO_CONFIRMADO');
+        return active;
+    }
+
+    // =========================================================
+    // TEMPLATE (Falha de transação — nameSync "1")
+    // =========================================================
+    function templatePayload() {
+        return {
+            sent_by: 'operator',
+            message: TEMPLATE.preview,
+            templateTitleMessage: null,
+            operator: String(getSessaoTallos()?.employeeId || ''),
+            channel: 'whatsapp',
+            templateMessage: {
+                idSync: TEMPLATE.idSync,
+                nameSync: TEMPLATE.nameSync,
+                params: TEMPLATE.params.map(item => ({ ...item })),
+                preview: TEMPLATE.preview,
+                type: TEMPLATE.type,
+                relative_path: '',
+                original_name: '',
+                infoMedia: { type: '', hasMedia: false },
+                id: TEMPLATE.id,
+                buttons: TEMPLATE.buttons.map(item => ({ ...item }))
+            }
+        };
+    }
+
+    async function enviarTemplate(customerId) {
+        const response = await requestSessao({
+            method: 'POST',
+            url: `${TALLOS_API}/megasac-api/messages/customer/${encodeURIComponent(customerId)}/send`,
+            data: templatePayload(),
+            timeout: 10000
+        });
+
+        if (Number(response.status || 0) !== 201) {
+            throw new Error(`TEMPLATE_HTTP_${response.status || 0}`);
+        }
+
+        const json = parseJSON(response.responseText);
+        const responseCustomerId = String(json?.customer?._id || json?.customer?.id || '');
+        const confirmed = Boolean(
+            json?.is_template_message === true &&
+            responseCustomerId === String(customerId) &&
+            Array.isArray(json?.box_buttons) &&
+            json.box_buttons.length === TEMPLATE.buttons.length
+        );
+
+        if (!confirmed) throw new Error('TEMPLATE_RESPOSTA_NAO_CONFIRMADA');
+        return true;
+    }
+
+    // =========================================================
+    // TRANSFERÊNCIA PARA O SETOR DE VENDAS
+    // =========================================================
+    function nomeFuncionario(item) {
+        return String(item?.name || item?.full_name || item?.fullName || '').trim();
+    }
+
+    function idFuncionario(item) {
+        return String(item?._id || item?.id || '');
+    }
+
+    async function listarFuncionariosTallos() {
+        const response = await requestSessao({
+            method: 'GET',
+            url: `${TALLOS_API}/megasac-api/employees/all/?inactive=0`,
+            timeout: 8000
+        });
+
+        const status = Number(response.status || 0);
+        if (status === 401 || status === 403) {
+            GM_setValue(KEY_TALLOS_SESSION, null);
+            throw new Error(`SESSAO_TALLOS_EXPIRADA_HTTP_${status}`);
+        }
+        if (status !== 200) {
+            throw new Error(`OPERADOR_HTTP_${status}`);
+        }
+
+        const json = parseJSON(response.responseText);
+        const list = Array.isArray(json) ? json : (json?.data || json?.docs || []);
+        return Array.isArray(list) ? list : [];
+    }
+
+    async function obterNomeOperadorTallos() {
+        const session = getSessaoTallos();
+        if (!session?.employeeId) throw new Error('SESSAO_TALLOS_SEM_OPERADOR');
+        if (session.employeeName) return session.employeeName;
+
+        const list = await listarFuncionariosTallos();
+        const employee = list.find(item => idFuncionario(item) === String(session.employeeId));
+        const name = nomeFuncionario(employee);
+
+        if (!name) throw new Error('NOME_OPERADOR_NAO_ENCONTRADO');
+
+        session.employeeName = name;
+        GM_setValue(KEY_TALLOS_SESSION, session);
+        return name;
+    }
+
+    async function transferirParaSetor(customerId) {
+        const actionBy = await obterNomeOperadorTallos();
+
+        const response = await requestSessao({
+            method: 'POST',
+            url: `${TALLOS_API}/customers/transfer-to-department`,
+            data: {
+                action_by: actionBy,
+                customer: String(customerId),
+                department_label: ID_DEPARTAMENTO,
+                department_name: NOME_DEPARTAMENTO,
+                transfer_ticket_link: false,
+                ticket_id: null
+            },
+            timeout: 10000
+        });
+
+        const status = Number(response.status || 0);
+        if (status < 200 || status >= 300) {
+            throw new Error(`TRANSFERENCIA_HTTP_${status || 0}`);
+        }
+        return response;
+    }
+
+    function nomeDepartamentoDaFila(item) {
+        return String(
+            item?.listView?.departmentInfo?.name ||
+            item?.departmentInfo?.name ||
+            item?.department?.name ||
+            item?.department_name ||
+            ''
+        ).trim();
+    }
+
+    async function confirmarTransferencia(customerId, phone) {
+        const deadline = Date.now() + 6000;
+
+        for (let attempt = 1; attempt <= 5; attempt++) {
+            const waiting = await consultarFila('queue_await', customerId, phone, deadline);
+
+            if (!waiting.ok) {
+                return { confirmed: false, reason: waiting.reason || 'FILA_NAO_CONFIRMADA' };
+            }
+
+            if (waiting.found) {
+                const department = nomeDepartamentoDaFila(waiting.item);
+                if (department === NOME_DEPARTAMENTO) {
+                    return {
+                        confirmed: true,
+                        state: 'WAITING',
+                        department,
+                        attempts: attempt
+                    };
+                }
+                return {
+                    confirmed: false,
+                    reason: `DEPARTAMENTO_DIVERGENTE_${department || 'SEM_NOME'}`
+                };
+            }
+
+            if (attempt < 5) await sleep(300);
+        }
+
+        return { confirmed: false, reason: 'WAITING_NAO_CONFIRMADO' };
+    }
+
+    async function transferirEConfirmar(customerId, phone) {
+        await transferirParaSetor(customerId);
+
+        const confirmed = await confirmarTransferencia(customerId, phone);
+        if (!confirmed.confirmed) {
+            throw new Error(confirmed.reason || 'TRANSFERENCIA_NAO_CONFIRMADA');
+        }
+        return confirmed;
+    }
+
+    // =========================================================
+    // FLUXO ÚNICO: CADASTRO + START + TEMPLATE + FILA
+    // =========================================================
+    function setStatus(text, tone = 'normal') {
+        const node = document.getElementById('status-tallos-v11');
+        if (!node) return;
+        node.textContent = text;
+        node.dataset.tone = tone;
+        node.style.color =
+            tone === 'ok' ? '#067647' :
+            tone === 'error' ? '#b42318' :
+            tone === 'busy' ? '#b54708' :
+            '#475467';
+        node.style.background =
+            tone === 'ok' ? '#ecfdf3' :
+            tone === 'error' ? '#fef3f2' :
+            tone === 'busy' ? '#fffaeb' :
+            '#f8fafc';
+        node.style.borderColor =
+            tone === 'ok' ? '#abefc6' :
+            tone === 'error' ? '#fecdca' :
+            tone === 'busy' ? '#fedf89' :
+            '#eaecf0';
+    }
+
+    function setButton(text, busy = false) {
+        const btn = document.getElementById('btn-tallos-integracao');
+        if (!btn) return;
+        btn.textContent = text;
+        btn.disabled = busy;
+        btn.style.opacity = busy ? '0.86' : '1';
+        btn.style.cursor = busy ? 'wait' : 'pointer';
+        btn.style.background = busy
+            ? 'linear-gradient(135deg,#f59e0b,#d97706)'
+            : 'linear-gradient(135deg,#16a34a,#15803d)';
+        btn.style.boxShadow = busy
+            ? '0 5px 14px rgba(217,119,6,.22)'
+            : '0 5px 14px rgba(21,128,61,.22)';
+    }
+
+    function setEtapaPainel(step, state = 'busy') {
+        etapaAtual = Number(step) || etapaAtual;
+        const all = Array.from(document.querySelectorAll('#painel-tallos [data-flow-step]'));
+        for (const el of all) {
+            const n = Number(el.dataset.flowStep || 0);
+            let status = 'idle';
+            if (n < step) status = 'ok';
+            else if (n === step) status = state;
+            if (state === 'done' && n <= step) status = 'ok';
+
+            el.dataset.state = status;
+            const circle = el.querySelector('.sbv12-step-dot');
+            if (circle) {
+                circle.textContent =
+                    status === 'ok' ? '✓' :
+                    status === 'error' ? '!' :
+                    String(n);
+            }
+        }
+    }
+
+    function marcarEtapaErro() {
+        if (!etapaAtual) return;
+        const el = document.querySelector(`#painel-tallos [data-flow-step="${etapaAtual}"]`);
+        if (!el) return;
+        el.dataset.state = 'error';
+        const circle = el.querySelector('.sbv12-step-dot');
+        if (circle) circle.textContent = '!';
+    }
+
+    function resetEtapasPainel() {
+        etapaAtual = 0;
+        document.querySelectorAll('#painel-tallos [data-flow-step]').forEach((el, index) => {
+            el.dataset.state = 'idle';
+            const circle = el.querySelector('.sbv12-step-dot');
+            if (circle) circle.textContent = String(index + 1);
+        });
+    }
+
+    function clamp(value, min, max) {
+        return Math.min(Math.max(value, min), max);
+    }
+
+    function salvarPosicaoPainel(container) {
+        try {
+            const rect = container.getBoundingClientRect();
+            GM_setValue(KEY_PANEL_POSITION, {
+                left: Math.round(rect.left),
+                top: Math.round(rect.top)
+            });
+        } catch {}
+    }
+
+    function restaurarPosicaoPainel(container) {
+        try {
+            const saved = GM_getValue(KEY_PANEL_POSITION, null);
+            if (!saved || !Number.isFinite(Number(saved.left)) || !Number.isFinite(Number(saved.top))) return;
+            const width = container.offsetWidth || 300;
+            const height = container.offsetHeight || 180;
+            const left = clamp(Number(saved.left), 6, Math.max(6, window.innerWidth - width - 6));
+            const top = clamp(Number(saved.top), 6, Math.max(6, window.innerHeight - Math.min(height, window.innerHeight - 12) - 6));
+            container.style.left = `${left}px`;
+            container.style.top = `${top}px`;
+            container.style.right = 'auto';
+            container.style.bottom = 'auto';
+        } catch {}
+    }
+
+    function instalarPainelMovivel(container, handle) {
+        if (!container || !handle) return;
+
+        let dragging = false;
+        let pointerId = null;
+        let offsetX = 0;
+        let offsetY = 0;
+
+        const move = event => {
+            if (!dragging || (pointerId != null && event.pointerId !== pointerId)) return;
+            const width = container.offsetWidth;
+            const height = container.offsetHeight;
+            const left = clamp(event.clientX - offsetX, 6, Math.max(6, window.innerWidth - width - 6));
+            const top = clamp(event.clientY - offsetY, 6, Math.max(6, window.innerHeight - Math.min(height, window.innerHeight - 12) - 6));
+            container.style.left = `${left}px`;
+            container.style.top = `${top}px`;
+            container.style.right = 'auto';
+            container.style.bottom = 'auto';
+        };
+
+        const end = event => {
+            if (!dragging || (pointerId != null && event.pointerId !== pointerId)) return;
+            dragging = false;
+            try { handle.releasePointerCapture(pointerId); } catch {}
+            handle.style.cursor = 'grab';
+            salvarPosicaoPainel(container);
+            pointerId = null;
+        };
+
+        handle.addEventListener('pointerdown', event => {
+            if (event.button !== 0) return;
+            if (event.target.closest('button,select,input')) return;
+
+            const rect = container.getBoundingClientRect();
+            dragging = true;
+            pointerId = event.pointerId;
+            offsetX = event.clientX - rect.left;
+            offsetY = event.clientY - rect.top;
+
+            container.style.left = `${rect.left}px`;
+            container.style.top = `${rect.top}px`;
+            container.style.right = 'auto';
+            container.style.bottom = 'auto';
+            handle.style.cursor = 'grabbing';
+
+            try { handle.setPointerCapture(pointerId); } catch {}
+            event.preventDefault();
+        });
+
+        handle.addEventListener('pointermove', move);
+        handle.addEventListener('pointerup', end);
+        handle.addEventListener('pointercancel', end);
+
+        window.addEventListener('resize', () => {
+            const rect = container.getBoundingClientRect();
+            const left = clamp(rect.left, 6, Math.max(6, window.innerWidth - container.offsetWidth - 6));
+            const top = clamp(rect.top, 6, Math.max(6, window.innerHeight - 60));
+            container.style.left = `${left}px`;
+            container.style.top = `${top}px`;
+            container.style.right = 'auto';
+            container.style.bottom = 'auto';
+            salvarPosicaoPainel(container);
+        });
+    }
+
+    // =========================================================
+    // PROGRESSO (RETOMAR DE ONDE PAROU)
+    // =========================================================
+    const NOMES_ETAPAS = ['', 'Cadastro', 'Atendimento (/start)', 'Template', 'Fila'];
+
+    function chaveFluxo(dados) {
+        return `${dados.localizador}|${digits(dados.telefone)}`;
+    }
+
+    function lerProgressos() {
+        const all = GM_getValue(KEY_FLOW_PROGRESS, {}) || {};
+        const agora = Date.now();
+        const validos = {};
+        for (const [key, value] of Object.entries(all)) {
+            if (value?.at && agora - value.at < PROGRESSO_VALIDADE_MS) validos[key] = value;
+        }
+        return validos;
+    }
+
+    function getProgresso(dados) {
+        const progresso = lerProgressos()[chaveFluxo(dados)];
+        return progresso && progresso.etapa >= 1 && progresso.etapa < 4 ? progresso : null;
+    }
+
+    function salvarProgresso(dados, info) {
+        const all = lerProgressos();
+        all[chaveFluxo(dados)] = { ...info, at: Date.now() };
+        GM_setValue(KEY_FLOW_PROGRESS, all);
+    }
+
+    function limparProgresso(dados) {
+        const all = lerProgressos();
+        delete all[chaveFluxo(dados)];
+        GM_setValue(KEY_FLOW_PROGRESS, all);
+    }
+
+    function horaCurta(ts) {
+        return new Date(ts).toLocaleString('pt-BR', {
+            day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'
+        });
+    }
+
+    async function executarCadastroEEnvio() {
+        if (fluxoEmAndamento) return;
+
+        const selectAgente = document.getElementById('select-agente-tallos');
+        const nomeSelecionado = selectAgente?.value || '';
+        if (!nomeSelecionado) {
+            alert('⚠️ Selecione o operador do turno antes de continuar.');
+            return;
+        }
+
+        if (!getSessaoTallos()) {
+            alert('⚠️ A Tallos não está com uma sessão conectada.\n\nAbra app.tallos.com.br, faça login e deixe a aba carregada. Depois tente novamente.');
+            return;
+        }
+
+        const dados = capturarDados();
+        if (!dados) {
+            alert('⛔ Não foi possível capturar os dados desta reserva.');
+            return;
+        }
+
+        if (dados.faltando?.length) {
+            const seguir = confirm(
+                `⚠️ Não consegui ler da tela: ${dados.faltando.join(' e ')}.\n\n` +
+                `Confira se a reserva está aberta. Continuar mesmo assim?`
+            );
+            if (!seguir) return;
+        }
+
+        if (!dados.telefone) {
+            const manual = prompt('Telefone não encontrado. Cole abaixo o número do cliente:');
+            if (!manual) return;
+            dados.telefone = normalizarTelefoneManual(manual);
+        }
+
+        if (!telefoneValido(dados.telefone)) {
+            alert('⛔ Telefone inválido. O fluxo foi cancelado antes de acessar a Tallos.');
+            return;
+        }
+
+        let progresso = getProgresso(dados);
+        if (progresso) {
+            const retomar = confirm(
+                `↩️ O último envio para este cliente parou depois da etapa ` +
+                `"${NOMES_ETAPAS[progresso.etapa]}" (${horaCurta(progresso.at)}).\n\n` +
+                `OK = continuar de onde parou\n` +
+                `Cancelar = começar do zero`
+            );
+            if (!retomar) {
+                limparProgresso(dados);
+                progresso = null;
+            }
+        }
+
+        fluxoEmAndamento = true;
+        resetEtapasPainel();
+        const tag = gerarTag(nomeSelecionado);
+
+        let feitas = progresso?.etapa || 0;
+        let contact = progresso
+            ? {
+                customerId: progresso.customerId,
+                phone: progresso.phone,
+                action: `RETOMADO_APOS_${NOMES_ETAPAS[progresso.etapa].toUpperCase()}`
+            }
+            : null;
+
+        try {
+            setButton('Verificando Tallos...', true);
+            setStatus('Confirmando que a aba da Tallos está respondendo...', 'busy');
+
+            if (!(await pingTallos())) {
+                throw new Error('ABA_TALLOS_NAO_RESPONDEU (abra ou recarregue app.tallos.com.br)');
+            }
+
+            if (feitas < 1) {
+                setEtapaPainel(1, 'busy');
+                setButton('1/4 • Cadastrando...', true);
+                setStatus('Localizando ou atualizando o contato na Tallos...', 'busy');
+
+                contact = await garantirContato(dados, tag);
+                feitas = 1;
+                salvarProgresso(dados, { etapa: 1, customerId: contact.customerId, phone: contact.phone });
+            }
+
+            if (feitas < 2) {
+                setEtapaPainel(2, 'busy');
+                setButton('2/4 • Iniciando atendimento...', true);
+                setStatus(`Contato confirmado • ${contact.action}. Iniciando atendimento...`, 'busy');
+
+                await iniciarAtendimento(contact.customerId, contact.phone);
+                feitas = 2;
+                salvarProgresso(dados, { etapa: 2, customerId: contact.customerId, phone: contact.phone });
+            }
+
+            if (feitas < 3) {
+                setEtapaPainel(3, 'busy');
+                setButton('3/4 • Enviando template...', true);
+                setStatus(`Atendimento confirmado. Enviando template "${TEMPLATE.label}"...`, 'busy');
+
+                await enviarTemplate(contact.customerId);
+                feitas = 3;
+                salvarProgresso(dados, { etapa: 3, customerId: contact.customerId, phone: contact.phone });
+            }
+
+            setEtapaPainel(4, 'busy');
+            setButton('4/4 • Enviando para fila...', true);
+            setStatus(`Template confirmado. Transferindo para ${NOME_DEPARTAMENTO}...`, 'busy');
+
+            const transfer = await transferirEConfirmar(contact.customerId, contact.phone);
+            feitas = 4;
+            limparProgresso(dados);
+
+            setEtapaPainel(4, 'done');
+            setStatus(`✅ Fluxo concluído • ${NOME_DEPARTAMENTO} confirmado.`, 'ok');
+            setButton('✅ Enviado para fila', false);
+
+            try {
+                await navigator.clipboard.writeText(digits(contact.phone).slice(-8));
+            } catch {}
+
+            alert(
+                `✅ FLUXO CONCLUÍDO\n\n` +
+                `Cliente: ${dados.nome}\n` +
+                `Cadastro: ${contact.action}\n` +
+                `Atendimento: iniciado\n` +
+                `Template: ${TEMPLATE.label} enviado\n` +
+                `Fila: ${transfer.department || NOME_DEPARTAMENTO} confirmada`
+            );
+
+            setTimeout(() => setButton('📲 Cadastrar + enviar + fila', false), 1800);
+        } catch (error) {
+            const reason = error?.message || String(error);
+            const etapaFalha = NOMES_ETAPAS[feitas + 1] || 'Verificação';
+            console.error('[Tallos V12.6] Fluxo interrompido:', error);
+            marcarEtapaErro();
+            setStatus(`⚠️ Parou em ${etapaFalha}: ${reason}`, 'error');
+            setButton(feitas ? '↩️ Continuar de onde parou' : '📲 Tentar novamente', false);
+
+            alert(
+                `⚠️ O fluxo foi interrompido com segurança na etapa "${etapaFalha}".\n\n` +
+                `${reason}\n\n` +
+                `O script não avançou para a etapa seguinte sem confirmação.` +
+                (feitas
+                    ? `\n\nAs etapas já concluídas foram salvas: no próximo clique dá para continuar de onde parou.`
+                    : '')
+            );
+        } finally {
+            fluxoEmAndamento = false;
+        }
+    }
+
+    // =========================================================
+    // AGENTES — LISTA FIXA + PRÉ-SELEÇÃO DO OPERADOR LOGADO
+    // =========================================================
+    let preSelecaoFeita = false;
+    let preSelecaoEmAndamento = false;
+
+    function normalizarNome(nome) {
+        return String(nome || '')
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .toLowerCase()
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function encontrarAgente(nome) {
+        const alvo = normalizarNome(nome);
+        if (!alvo) return '';
+        // Igual ao nome da lista, ou nome da Tallos começando por ele
+        // (ex.: "Gilmário Lima Souza" -> "Gilmario Lima").
+        return AGENTES.find(agente => {
+            const a = normalizarNome(agente);
+            return alvo === a || alvo.startsWith(a + ' ');
+        }) || '';
+    }
+
+    function preencherSelectAgentes(select) {
+        const salvo = String(GM_getValue(KEY_AGENT_SELECTED, '') || '');
+
+        select.innerHTML = '';
+
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = 'Selecione o Agente...';
+        select.appendChild(placeholder);
+
+        for (const nome of AGENTES) {
+            const option = document.createElement('option');
+            option.value = nome;
+            option.textContent = nome;
+            select.appendChild(option);
+        }
+
+        // Seleção antiga que não está mais na lista é descartada.
+        select.value = AGENTES.includes(salvo) ? salvo : '';
+        if (!select.value && salvo) GM_setValue(KEY_AGENT_SELECTED, '');
+    }
+
+    async function preSelecionarOperadorLogado(select) {
+        if (preSelecaoFeita || preSelecaoEmAndamento || !select || select.value) return;
+        if (!tallosConectada()) return;
+
+        preSelecaoEmAndamento = true;
+        try {
+            const nome = await obterNomeOperadorTallos();
+            const agente = encontrarAgente(nome);
+            if (agente && !select.value) {
+                select.value = agente;
+                GM_setValue(KEY_AGENT_SELECTED, agente);
+            }
+        } catch (error) {
+            console.warn('[Tallos V12.6.1] Pré-seleção do operador:', error);
+        } finally {
+            preSelecaoFeita = true;
+            preSelecaoEmAndamento = false;
+        }
+    }
+
+    // =========================================================
+    // INTERFACE NO SMARTBUS
+    // =========================================================
+    function criarInterface() {
+        if (!document.body || document.getElementById('painel-tallos')) return;
+
+        const style = document.createElement('style');
+        style.textContent = `
+            #painel-tallos{
+                position:fixed;
+                right:24px;
+                bottom:56px;
+                z-index:2147483000;
+                width:304px;
+                max-width:calc(100vw - 20px);
+                box-sizing:border-box;
+                background:#fff;
+                border:1px solid #e4e7ec;
+                border-radius:14px;
+                box-shadow:0 14px 40px rgba(16,24,40,.18);
+                font-family:Inter,Segoe UI,Arial,sans-serif;
+                color:#101828;
+                overflow:hidden;
+                user-select:none;
+            }
+            #painel-tallos *{box-sizing:border-box}
+            #painel-tallos .sbv12-head{
+                display:flex;
+                align-items:center;
+                justify-content:space-between;
+                gap:10px;
+                padding:11px 12px;
+                background:linear-gradient(135deg,#f8fafc,#f1f5f9);
+                border-bottom:1px solid #eaecf0;
+                cursor:grab;
+                touch-action:none;
+            }
+            #painel-tallos .sbv12-brand{display:flex;align-items:center;gap:9px;min-width:0}
+            #painel-tallos .sbv12-logo{
+                width:31px;height:31px;border-radius:9px;
+                display:grid;place-items:center;
+                background:linear-gradient(135deg,#2563eb,#1d4ed8);
+                color:#fff;font-size:15px;font-weight:800;
+                box-shadow:0 4px 10px rgba(37,99,235,.20)
+            }
+            #painel-tallos .sbv12-title{min-width:0}
+            #painel-tallos .sbv12-title b{display:block;font-size:12px;letter-spacing:.2px;color:#1d2939}
+            #painel-tallos .sbv12-title span{display:block;margin-top:1px;font-size:9px;color:#667085;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+            #painel-tallos .sbv12-collapse{
+                width:28px;height:28px;border:1px solid #d0d5dd;border-radius:7px;
+                background:#fff;color:#475467;cursor:pointer;font-weight:800;font-size:15px
+            }
+            #painel-tallos .sbv12-collapse:hover{background:#f9fafb}
+            #painel-tallos .sbv12-body{padding:12px;display:flex;flex-direction:column;gap:10px}
+            #painel-tallos[data-collapsed="1"] .sbv12-body{display:none}
+            #painel-tallos[data-collapsed="1"]{width:250px}
+            #painel-tallos .sbv12-connection{
+                display:flex;align-items:center;gap:7px;padding:8px 9px;
+                border:1px solid #eaecf0;border-radius:8px;background:#f9fafb;
+                font-size:10px;font-weight:700;color:#475467
+            }
+            #painel-tallos .sbv12-dot{
+                width:8px;height:8px;border-radius:50%;background:#98a2b3;
+                box-shadow:0 0 0 3px rgba(152,162,179,.12);flex:0 0 auto
+            }
+            #painel-tallos .sbv12-connection[data-ready="1"]{background:#f0fdf4;border-color:#bbf7d0;color:#166534}
+            #painel-tallos .sbv12-connection[data-ready="1"] .sbv12-dot{background:#16a34a;box-shadow:0 0 0 3px rgba(22,163,74,.12)}
+            #painel-tallos label{font-size:10px;color:#475467;font-weight:700}
+            #painel-tallos select{
+                width:100%;padding:9px 10px;border:1px solid #d0d5dd;border-radius:8px;
+                background:#fff;color:#344054;font-size:12px;outline:none;cursor:pointer
+            }
+            #painel-tallos select:focus{border-color:#84adff;box-shadow:0 0 0 3px rgba(47,128,237,.10)}
+            #painel-tallos .sbv12-steps{display:grid;grid-template-columns:repeat(4,1fr);gap:4px}
+            #painel-tallos .sbv12-step{
+                min-width:0;text-align:center;padding:5px 2px 4px;border-radius:7px;
+                background:#f8fafc;border:1px solid #eef2f6;color:#98a2b3;
+                transition:.15s ease
+            }
+            #painel-tallos .sbv12-step-dot{
+                width:20px;height:20px;border-radius:50%;display:grid;place-items:center;
+                margin:0 auto 3px;background:#e4e7ec;color:#667085;font-size:9px;font-weight:800
+            }
+            #painel-tallos .sbv12-step-name{display:block;font-size:8px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+            #painel-tallos .sbv12-step[data-state="busy"]{background:#fffaeb;border-color:#fedf89;color:#b54708}
+            #painel-tallos .sbv12-step[data-state="busy"] .sbv12-step-dot{background:#f79009;color:#fff}
+            #painel-tallos .sbv12-step[data-state="ok"]{background:#ecfdf3;border-color:#abefc6;color:#067647}
+            #painel-tallos .sbv12-step[data-state="ok"] .sbv12-step-dot{background:#17b26a;color:#fff}
+            #painel-tallos .sbv12-step[data-state="error"]{background:#fef3f2;border-color:#fecdca;color:#b42318}
+            #painel-tallos .sbv12-step[data-state="error"] .sbv12-step-dot{background:#d92d20;color:#fff}
+            #painel-tallos #status-tallos-v11{
+                min-height:42px;padding:8px 9px;border:1px solid #eaecf0;border-radius:8px;
+                background:#f8fafc;font-size:10px;line-height:1.35;color:#475467;
+                user-select:text;overflow-wrap:anywhere
+            }
+            #painel-tallos #btn-tallos-integracao{
+                width:100%;padding:11px 12px;border:0;border-radius:9px;
+                color:#fff;font-size:12px;font-weight:800;cursor:pointer;
+                background:linear-gradient(135deg,#16a34a,#15803d);
+                box-shadow:0 5px 14px rgba(21,128,61,.22);
+                transition:transform .12s ease,filter .12s ease
+            }
+            #painel-tallos #btn-tallos-integracao:not(:disabled):hover{filter:brightness(.98);transform:translateY(-1px)}
+            #painel-tallos .sbv12-foot{font-size:8px;text-align:center;color:#98a2b3}
+        `;
+        document.head.appendChild(style);
+
+        const container = document.createElement('section');
+        container.id = 'painel-tallos';
+        container.dataset.collapsed = GM_getValue(KEY_PANEL_COLLAPSED, false) ? '1' : '0';
+
+        container.innerHTML = `
+            <div class="sbv12-head">
+                <div class="sbv12-brand">
+                    <div class="sbv12-logo">T</div>
+                    <div class="sbv12-title">
+                        <b>SMART BUS → TALLOS</b>
+                        <span>Cadastro V12.6.1 • template • fila automática</span>
+                    </div>
+                </div>
+                <button class="sbv12-collapse" type="button" title="Minimizar painel">${container.dataset.collapsed === '1' ? '+' : '−'}</button>
+            </div>
+            <div class="sbv12-body">
+                <div class="sbv12-connection" id="status-sessao-tallos-v11">
+                    <span class="sbv12-dot"></span>
+                    <span class="sbv12-connection-text">Verificando Tallos...</span>
+                </div>
+
+                <div>
+                    <label for="select-agente-tallos">Operador do turno</label>
+                    <select id="select-agente-tallos"></select>
+                </div>
+
+                <div class="sbv12-steps" aria-label="Etapas do envio">
+                    <div class="sbv12-step" data-flow-step="1" data-state="idle">
+                        <span class="sbv12-step-dot">1</span><span class="sbv12-step-name">Cadastro</span>
+                    </div>
+                    <div class="sbv12-step" data-flow-step="2" data-state="idle">
+                        <span class="sbv12-step-dot">2</span><span class="sbv12-step-name">/start</span>
+                    </div>
+                    <div class="sbv12-step" data-flow-step="3" data-state="idle">
+                        <span class="sbv12-step-dot">3</span><span class="sbv12-step-name">Template</span>
+                    </div>
+                    <div class="sbv12-step" data-flow-step="4" data-state="idle">
+                        <span class="sbv12-step-dot">4</span><span class="sbv12-step-name">Fila</span>
+                    </div>
+                </div>
+
+                <div id="status-tallos-v11">Aguardando envio.</div>
+                <button id="btn-tallos-integracao" type="button">📲 Cadastrar + enviar + fila</button>
+                <div class="sbv12-foot">Arraste pelo cabeçalho para mover • posição salva automaticamente</div>
+            </div>
+        `;
+
+        document.body.appendChild(container);
+
+        const select = container.querySelector('#select-agente-tallos');
+        preencherSelectAgentes(select);
+
+        select.addEventListener('change', () => {
+            GM_setValue(KEY_AGENT_SELECTED, select.value || '');
+        });
+
+        select.addEventListener('keydown', event => {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                executarCadastroEEnvio();
+            }
+        });
+
+        const btn = container.querySelector('#btn-tallos-integracao');
+        btn.addEventListener('click', executarCadastroEEnvio);
+
+        const collapse = container.querySelector('.sbv12-collapse');
+        collapse.addEventListener('click', event => {
+            event.stopPropagation();
+            const next = container.dataset.collapsed === '1' ? '0' : '1';
+            container.dataset.collapsed = next;
+            GM_setValue(KEY_PANEL_COLLAPSED, next === '1');
+            collapse.textContent = next === '1' ? '+' : '−';
+            collapse.title = next === '1' ? 'Expandir painel' : 'Minimizar painel';
+            requestAnimationFrame(() => salvarPosicaoPainel(container));
+        });
+
+        instalarPainelMovivel(container, container.querySelector('.sbv12-head'));
+        requestAnimationFrame(() => restaurarPosicaoPainel(container));
+
+        const refresh = () => {
+            const connection = container.querySelector('#status-sessao-tallos-v11');
+            const textNode = connection.querySelector('.sbv12-connection-text');
+            const ready = tallosConectada();
+            connection.dataset.ready = ready ? '1' : '0';
+            textNode.textContent = ready
+                ? 'Tallos conectada e autenticada'
+                : 'Abra a Tallos e mantenha a sessão ativa';
+
+            // Se ninguém estiver selecionado, tenta marcar quem está logado na Tallos.
+            if (ready) preSelecionarOperadorLogado(select);
+        };
+
+        resetEtapasPainel();
+        refresh();
+        setInterval(refresh, 2000);
+    }
+
+    // =========================================================
+    // BOOT
+    // =========================================================
+    if (location.hostname === TALLOS_HOST) {
+        iniciarPonteTallos();
+        return;
+    }
+
+    if (location.hostname === SMARTBUS_HOST) {
+        try { unsafeWindow.__tallosTestarTokenSessao = testarTokenSessaoContatos; } catch {}
+
+        const boot = () => {
+            if (document.body) criarInterface();
+            else setTimeout(boot, 250);
+        };
+        setTimeout(boot, 1200);
+    }
+})();
