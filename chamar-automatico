@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Integração SMART BUS -> Tallos V12.7.0 (Pesquisa automática + template novo)
+// @name         chamar automatico
 // @namespace    http://tampermonkey.net/
 // @version      12.7.0
 // @description  V12.7.0: tudo em um — pesquisa automática do cliente e envio para a fila com o template "1" (falha de transação, @SALDACAO). "Não emitido" -> fila e fecha; "Emitido"/"Devolvido" -> fecha; parou no /start -> fecha. Erro em etapa tenta 2x. Ponte por eventos (aba Tallos em 2º plano), trava entre abas, CPF só do cupom, 401 centralizado.
