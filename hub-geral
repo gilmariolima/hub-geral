@@ -9,6 +9,7 @@
 // @grant        GM_setClipboard
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        unsafeWindow
 // @grant        GM_addValueChangeListener
 // @grant        GM_removeValueChangeListener
 // @run-at       document-idle
@@ -3504,6 +3505,16 @@ function registrarModulo(mod) {
 Identificamos que sua tentativa de compra anterior deu erro e foi cancelada. Irei gerar sua nova reserva e acompanhar todo o processo para garantir que seja finalizada com sucesso, conforme sua solicitação.
 ` },
 
+            {
+                icon: '🙉',
+                title: 'SIM',
+                texto: `Prezado(a) cliente, esse atendimento gerou um protocolo de número: @PROTOCOLO
+@SALDACAO @CLIENTE, me chamo @ATENDENTE, sou agente de viagens autorizado de todo o grupo Guanabara.
+
+Estarei dando continuidade a seu atendimento.`
+            },
+
+
             { icon: '🚌', title: 'REMARCACAO', texto: `🚌 Remarcação de Passagem
 
 *Para remarcar, preciso que você envie:*
@@ -3532,9 +3543,20 @@ Data: data da partida da viagem
 
 *Informe se a viagem tem volta*` },
 
-            { icon: '⛔', title: 'POLTRONA OCUPADA', texto: `A poltrona do(a) senhor(a) vai ficar bloqueada por até 10 minutos devido a tentativa cancelada anteriormente, poderia ser outra poltrona?
+            { icon: 'C', title: 'CINZAS', texto: `Poltronas Cinzas livres, qual deseja?` },
 
-*CINZAS LIVRES*` },
+
+            { icon: '⛔', title: 'POLTRONA SENHORA', texto: `A poltrona da senhora vai ficar bloqueada por até 10 minutos devido a tentativa cancelada anteriormente.
+
+1 - Deseja aguardar a mesma liberar
+ou
+2 - Pode ser outra, poltronas cinzas livres.` },
+
+ { icon: '⛔', title: 'POLTRONA SENHOR', texto: `A poltrona do senhor vai ficar bloqueada por até 10 minutos devido a tentativa cancelada anteriormente.
+
+1 - Deseja aguardar a mesma liberar
+ou
+2 - Pode ser outra, cinzas livres.` },
 
             { icon: '💺', title: 'POLTRONAS', texto: `💺 Mapa de Poltronas
 
@@ -3553,23 +3575,20 @@ Data de Nascimento:` },
 
             { icon: '⚠️', title: 'CONFERE', texto: `*Por gentileza, poderia conferir se todas as informações da sua reserva estão corretas? (Passageiro, Trecho, Data, horário e poltrona*)` },
 
-            { icon: '⚠️', title: 'REFORCA DADOS', texto: `Senhor(a), reforçamos que é essencial a conferência de todos os dados do bilhete, a fim de evitar qualquer tipo de transtorno futuro.
-
-A verificação de todas as informações do bilhete é de responsabilidade do passageiro.` },
-
 { icon: '🔗', title: 'LINK', texto: `Segue link para pagamentos via PIX e cartão, lembrando que para pagamentos via cartão de crédito, os dados do comprador são referentes ao proprietário do cartão.` },
 
-            { icon: '🔗', title: 'CV', texto: `Segue link para pagamento via Cartão de crédito e PIX:
+           {
+                icon: '🔗',
+                title: 'CV',
+                texto: `Segue link para pagamento via Cartão de crédito e PIX:\u00A0\u00A0
 
-PAGAMENTO CARTÃO.
-1: Utilizar o virtual para finalizar a compra online.
-2: Em COMPRADOR colocar os dados COMPLETOS do titular do cartão virtual.
-3: Em PAGAMENTO colocar os dados CONFORME consta no cartão virtual.
-4: Limpar os dados do navegador ou trocar de navegador, antes de tentar novamente.
-5: Trocar o E-mail, pois alguns e-mails o nosso sistema não reconhece e acaba cancelando a reserva.
-6: No CEP da fatura, preencher com o CEP do local onde foi solicitado o cartão.
-
-LINK DE PAGAMENTO VÁLIDO POR APENAS 30 MINUTOS.` },
+Passo a passo. (CARTÃO)
+1. Preencher os dados em comprador e pagamento referente ao titular do cartão.
+2. Gere um novo virtual ou tente com um cartão diferente dos usados anteriormente.
+3. Limpar os dados ou abrir uma nova guia no navegador.
+4. CEP da fatura, preencher referente ao CEP em que foi feito o pedido do cartão (físico).
+5. Ao solicitar o token de confirmação da compra, verificar e aceitar no banco.`
+            },
 
             { icon: '❖', title: 'PIX', texto: `Segue abaixo os dados bancários para transferência via PIX!
 
@@ -3580,18 +3599,13 @@ CHAVE CNPJ: 18.826.066/0001-09
 
 Emissão da passagem mediante ao envio do comprovante de pagamento!` },
 
-            { icon: '🏁', title: 'COMPRA FIM', texto: `Sua compra foi realizada com sucesso! 🎉
-
-Suas passagens serão enviadas por este chat em instantes. Além disso, uma cópia também será encaminhada para o e-mail informado no momento da compra.
+            { icon: '🏁', title: 'COMPRA FIM', texto: `Sua compra foi efetuada com sucesso!
+Peço que verifique o e-mail cadastrado na hora da compra (caixa de entrada e spam) por gentileza, pode levar ate 15 minutos para a passagens chegarem no e-mail!
 
 Posso ajudar em mais alguma coisa?` },
 
             { icon: '🔎', title: 'VERIFICA', texto: `Confira se os dados do seu bilhete estão corretos
-Verifique trecho, data, horário e dados pessoais no bilhete anexo ou enviado por e-mail.
-
-Se houver algum erro, avise em até 30 minutos.
-
-Alterações devem ser solicitadas com até 3 horas antes do embarque, dentro do nosso horário de atendimento. Após esse prazo, será cobrada multa de 20% do valor da passagem.` },
+Verifique trecho, data, horário e dados pessoais.` },
 
             { icon: '🤔', title: 'AGRADECE', texto: `Agradeço o contato, confiança e preferência em nosso trabalho. Ficamos à disposição para lhe atender posteriormente.
 
@@ -3625,15 +3639,11 @@ Podem viajar sozinhos, sem autorização, desde que apresentem documento de iden
 ⚠️ Os horários podem sofrer alterações, pois os ônibus estão sujeitos às condições da viagem e do trânsito.
 Estamos à disposição 24h. Qualquer dúvida, é só chamar! 😊` },
 
-            { icon: '🖨️', title: 'REENVIO', texto: `Para reenvio de PDF preciso que me encaminhe a foto da documentação frente e verso do titular do bilhete, para que fique registrado em sistema que o mesmo está ciente da solicitação.
-
-E informar o e-mail de reenvio.` },
-
-            { icon: '🛂', title: 'EMBARQUE', texto: `Basta mostrar o PDF do bilhete ao motorista pela tela do celular no momento do embarque junto com o documento original físico com foto ( PREFERÊNCIA RG) que consegue embarcar normalmente, mas caso deseje imprimir os bilhetes, basta chegar 30min antes do horário de embarque, se dirigir até o guichê e com o localizador, imprimir o bilhete.` },
+            { icon: '🛂', title: 'EMBARQUE', texto: `Basta mostrar o PDF do bilhete ao motorista pela tela do celular junto com o documento original físico com foto, mas caso deseje imprimir os bilhetes, basta se dirigir até o guichê e imprimir o bilhete.` },
 
             { icon: '🛎️', title: 'RESERVA', texto: `Estarei gerando a reserva do(a) senhor(a) para darmos continuidade por aqui, tudo bem?` },
 
-            { icon: '🔁', title: 'CONTINUIDADE', texto: `@CLIENTE, caso deseje dar continuidade, será criada uma reserva conforme sua solicitação anterior, porém, forneceremos algumas orientações que estarão lhe ajudando na conclusão de sua compra.
+            { icon: '🔁', title: 'CONTINUIDADE', texto: `@CLIENTE, caso deseje dar continuidade, será criada uma reserva conforme sua solicitação anterior,
 
 Gostaria de dar continuidade a sua reserva agora mesmo?` },
 
@@ -4586,7 +4596,433 @@ function criarModuloRemoverAcentos() {
 }
 
 registrarModulo(criarModuloRemoverAcentos());
+// =========================================================================
+// MÓDULO 15 — Tallos: Ocultar Botões da Barra do Editor + Itens do Menu
+// =========================================================================
+function criarModuloTallosOcultarBotoesBarra() {
+    const ESTILO_ID = 'tmm-tallos-ocultar-botoes-barra';
+    const ATTR_OCULTO = 'data-tmm-oculto';
 
+    // Botões da barra do editor (Quill). Comente (//) a linha de qualquer
+    // botão que você quiser manter visível.
+    const BOTOES_OCULTAR = [
+        'ql-bold',
+        'ql-italic',
+        'ql-reset',
+        'ql-emoji',
+        'ql-trigger_message',
+        'ql-template_messages',
+        'ql-microphone',
+    ];
+
+    // Itens do menu lateral do Tallos, identificados pelo id (sem o "-label").
+    const ITENS_MENU_OCULTAR = [
+        'primaryItemTickets',
+    ];
+
+    // Elementos que só dá para achar pela posição (índice começa em 0).
+    const POR_INDICE_OCULTAR = [
+        { seletor: '.ButtonBase__Root-sc-3vs9dj-0', indice: 3 },
+    ];
+
+    let styleEl = null;
+    let observer = null;
+    let agendado = false;
+
+    function ocultarPorIndice() {
+        agendado = false;
+        for (const { seletor, indice } of POR_INDICE_OCULTAR) {
+            const el = document.querySelectorAll(seletor)[indice];
+            if (el && !el.hasAttribute(ATTR_OCULTO)) {
+                el.setAttribute(ATTR_OCULTO, '1');
+                el.style.setProperty('display', 'none', 'important');
+            }
+        }
+    }
+
+    function agendar() {
+        if (agendado) return;
+        agendado = true;
+        requestAnimationFrame(ocultarPorIndice);
+    }
+
+    return {
+        id: 'tallos_ocultar_botoes_barra',
+        name: 'TALLOS - Ocultar botões da barra',
+        defaultOn: true,
+        fixo: false,
+
+        init() {
+            if (!location.hostname.includes('tallos.com.br')) return;
+            if (document.getElementById(ESTILO_ID)) return;
+
+            const seletoresBarra = BOTOES_OCULTAR
+                .map(cls => `.ql-toolbar button.${cls}`);
+
+            const seletoresMenu = ITENS_MENU_OCULTAR.flatMap(id => [
+                `#${id}`,
+                `#${id}-label`,
+                `a:has(#${id}-label)`,
+                `button:has(#${id}-label)`,
+                `li:has(> a #${id}-label, > button #${id}-label)`,
+                `[role="button"]:has(#${id}-label)`,
+                `[role="menuitem"]:has(#${id}-label)`,
+            ]);
+
+            const todosSeletores = [...seletoresBarra, ...seletoresMenu].join(',\n');
+
+            styleEl = document.createElement('style');
+            styleEl.id = ESTILO_ID;
+            styleEl.textContent = `
+                ${todosSeletores} {
+                    display: none !important;
+                }
+            `;
+            document.head.appendChild(styleEl);
+
+            ocultarPorIndice();
+            observer = new MutationObserver(agendar);
+            observer.observe(document.body, { childList: true, subtree: true });
+        },
+
+        destroy() {
+            styleEl?.remove();
+            styleEl = null;
+
+            observer?.disconnect();
+            observer = null;
+
+            document.querySelectorAll(`[${ATTR_OCULTO}]`).forEach(el => {
+                el.removeAttribute(ATTR_OCULTO);
+                el.style.removeProperty('display');
+            });
+        }
+    };
+}
+
+registrarModulo(criarModuloTallosOcultarBotoesBarra());
+
+// =========================================================================
+// MÓDULO 16 — Print da Reserva (itinerário + valores, copia/baixa PNG)
+// Cabeçalho do script (recomendado):
+// @require https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js
+// @grant   unsafeWindow   (necessário para o carregamento reserva funcionar)
+// =========================================================================
+function criarModuloPrintReserva() {
+    const BTN_ID = 'tmm-print-reserva-btn';
+    const COMP_ID = 'tmm-print-reserva-composicao';
+    const LARGURA = 1150;          // largura total do print (px)
+    const LARG_VALORES = 380;      // largura da coluna de valores (px)
+    const COR_BOTAO = '#8b0000';   // vermelho escuro (mesmo tom do CADASTRAR)
+    const ESCALA = 1.25;           // nitidez: 1 = mais rápido, 2 = mais nítido
+
+    let observer = null;
+    let debounceId = null;
+    let handleKeydown = null;
+
+    // ---------- Busca de elementos ----------
+    function acharElementoPorTexto(texto, raiz = document.body) {
+        const walker = document.createTreeWalker(raiz, NodeFilter.SHOW_TEXT);
+        let n;
+        while ((n = walker.nextNode())) {
+            if (n.nodeValue.trim() === texto) return n.parentElement;
+        }
+        return null;
+    }
+
+    // Sobe a partir do texto até o maior bloco que não engole as seções vizinhas
+    function cardDe(textoInicial, marcadoresVizinhos) {
+        let el = acharElementoPorTexto(textoInicial);
+        if (!el) return null;
+        while (el.parentElement && el.parentElement !== document.body) {
+            const txt = el.parentElement.innerText || '';
+            if (marcadoresVizinhos.some(m => txt.includes(m))) break;
+            el = el.parentElement;
+        }
+        return el;
+    }
+
+    // Sobe de "el" até o filho de um bloco que contém algum marcador (dentro do clone)
+    function subirAte(el, limite, marcadores) {
+        while (el.parentElement && el.parentElement !== limite.parentElement) {
+            const txt = el.parentElement.textContent || '';
+            if (marcadores.some(m => txt.includes(m))) return el;
+            el = el.parentElement;
+        }
+        return null;
+    }
+
+    function numeroReserva() {
+        const rotulo = acharElementoPorTexto('Nro da reserva');
+        const m = (rotulo?.parentElement?.innerText || '').match(/\b[A-Z0-9]{5,8}\b/);
+        return m ? m[0] : 'reserva';
+    }
+
+    // Remove a parte "Pagamentos" do card de valores (no clone)
+    function removerPagamentos(card) {
+        const t = acharElementoPorTexto('Pagamentos dessa', card) || acharElementoPorTexto('Pagamentos', card);
+        if (!t) return card;
+        const bloco = subirAte(t, card, ['Valores dessa']);
+        if (!bloco) return card;
+        const pai = bloco.parentElement;
+        let n = bloco;
+        while (n) { const prox = n.nextElementSibling; n.remove(); n = prox; }
+        let ult = pai.lastElementChild;
+        while (ult && !ult.textContent.trim() && ult.tagName !== 'TABLE') {
+            const ant = ult.previousElementSibling; ult.remove(); ult = ant;
+        }
+        return card;
+    }
+
+    // ---------- Monta o layout do print ----------
+    function montarComposicao() {
+        const SERV = 'Serviços dessa', VAL = 'Valores dessa', PASS = 'Passageiros dessa';
+
+        const titulo = cardDe('Visualização da reserva', [SERV, 'Nro da reserva']);
+        const resumo = cardDe('Nro da reserva', [SERV, 'Visualização da reserva']);
+        const itinerario = cardDe(SERV, [VAL, PASS]);
+        const valores = cardDe(VAL, [SERV, PASS]);
+
+        if (!itinerario || !valores) return null;
+
+        const prep = (el) => {
+            const c = el.cloneNode(true);
+            // tira do print qualquer botão (PRINT, Copiar Trecho, Copiar Dados etc.)
+            c.querySelectorAll('button, .tm-copiar-btn, .tm-preencher-area').forEach(b => b.remove());
+            // tira a borda tracejada do módulo "Área de clique e copia"
+            c.querySelectorAll('[data-copiar-ativo]').forEach(el => {
+                el.style.border = '';
+                el.style.padding = '';
+                el.style.borderRadius = '';
+            });
+            Object.assign(c.style, {
+                width: 'auto', maxWidth: 'none', flex: 'none',
+                margin: '0', position: 'static', float: 'none'
+            });
+            return c;
+        };
+
+        const comp = document.createElement('div');
+        comp.id = COMP_ID;
+        Object.assign(comp.style, {
+            position: 'absolute',
+            top: window.scrollY + 'px',
+            left: '0',
+            width: LARGURA + 'px',
+            padding: '16px',
+            boxSizing: 'border-box',
+            background: getComputedStyle(document.body).backgroundColor || '#f3f4f6',
+            opacity: '0',
+            pointerEvents: 'none',
+            zIndex: '-1',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '14px'
+        });
+
+        // Cabeçalho: só o resumo (sem o título "Reserva / Visualização da reserva")
+        if (resumo) {
+            const r = prep(resumo);
+            if (titulo && resumo.contains(titulo)) {
+                const t = acharElementoPorTexto('Visualização da reserva', r);
+                const tituloClone = t && subirAte(t, r, ['Nro da reserva']);
+                if (tituloClone) tituloClone.remove();
+            }
+            comp.appendChild(r);
+        }
+
+        const linha = document.createElement('div');
+        Object.assign(linha.style, {
+            display: 'grid',
+            gridTemplateColumns: `1fr ${LARG_VALORES}px`,
+            gap: '14px',
+            alignItems: 'start'
+        });
+        linha.appendChild(prep(itinerario));
+        linha.appendChild(removerPagamentos(prep(valores)));
+        comp.appendChild(linha);
+
+        document.body.appendChild(comp);
+        return comp;
+    }
+
+    // ---------- Carregamento do html2canvas ----------
+    const URL_H2C = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
+    let h2cPromise = null;
+
+    // 1º tenta o @require; se não tiver, baixa a biblioteca na hora (só uma vez)
+    function obterHtml2canvas() {
+        if (typeof html2canvas === 'function') return Promise.resolve(html2canvas);
+        const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+        if (typeof w.html2canvas === 'function') return Promise.resolve(w.html2canvas);
+
+        if (!h2cPromise) {
+            h2cPromise = new Promise((resolve, reject) => {
+                const s = document.createElement('script');
+                s.src = URL_H2C;
+                s.onload = () => (typeof w.html2canvas === 'function')
+                    ? resolve(w.html2canvas)
+                    : reject(new Error('html2canvas baixou mas não ficou acessível (falta @grant unsafeWindow?)'));
+                s.onerror = () => reject(new Error('Não consegui baixar o html2canvas (site bloqueou ou sem internet)'));
+                document.head.appendChild(s);
+            }).catch(err => { h2cPromise = null; throw err; });
+        }
+        return h2cPromise;
+    }
+
+    // ---------- Captura ----------
+    async function gerarCanvas() {
+        const h2c = await obterHtml2canvas();
+        const comp = montarComposicao();
+        if (!comp) throw new Error('Não encontrei as seções da reserva na tela.');
+        try {
+            return await h2c(comp, {
+                backgroundColor: comp.style.background,
+                scale: ESCALA,
+                useCORS: true,
+                logging: false,
+                imageTimeout: 1500,
+                windowWidth: Math.max(window.innerWidth, LARGURA + 100),
+                // só copia o caminho até a composição (bem mais rápido)
+                ignoreElements: (el) =>
+                    el !== document.body &&
+                    document.body.contains(el) &&
+                    !el.contains(comp) &&
+                    !comp.contains(el),
+                onclone: (doc) => {
+                    const c = doc.getElementById(COMP_ID);
+                    if (c) { c.style.opacity = '1'; c.style.zIndex = '1'; }
+                }
+            });
+        } finally {
+            comp.remove();
+        }
+    }
+
+    const canvasParaBlob = (canvas) => new Promise(res => canvas.toBlob(res, 'image/png'));
+
+    function baixar(blob, nome) {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = nome;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    }
+
+    function feedback(btn, texto, cor) {
+        btn.textContent = texto;
+        btn.style.background = cor;
+        setTimeout(() => {
+            btn.textContent = btn.dataset.label;
+            btn.style.background = COR_BOTAO;
+        }, 1800);
+    }
+
+    async function tirarPrint(e) {
+        const btn = document.getElementById(BTN_ID);
+        if (!btn) return;
+        const nome = `reserva_${numeroReserva()}_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.png`;
+        btn.textContent = 'Capturando...';
+
+        const blobPromise = gerarCanvas().then(canvasParaBlob);
+
+        try {
+            if (e.shiftKey || !navigator.clipboard || typeof ClipboardItem === 'undefined') {
+                baixar(await blobPromise, nome);
+                feedback(btn, '✔ Baixado', '#2e7d32');
+            } else {
+                // ClipboardItem com Promise mantém o "gesto do usuário" válido no Chrome
+                await navigator.clipboard.write([new ClipboardItem({ 'image/png': blobPromise })]);
+                feedback(btn, '✔ Copiado!', '#2e7d32');
+            }
+        } catch (err) {
+            console.error('[Print Reserva]', err);
+            try {
+                baixar(await blobPromise, nome);
+                feedback(btn, '✔ Baixado', '#2e7d32');
+            } catch {
+                feedback(btn, '✖ Erro', '#c62828');
+            }
+        }
+    }
+
+    // ---------- Botão (canto superior direito do card Itinerário) ----------
+    function criarBotao() {
+        const btn = document.createElement('button');
+        btn.id = BTN_ID;
+        btn.type = 'button';
+        btn.dataset.label = 'PRINT';
+        btn.textContent = btn.dataset.label;
+        btn.title = 'Clique: copia o print | Shift+Clique: baixa PNG | Atalho: Alt+P';
+        Object.assign(btn.style, {
+            position: 'absolute', top: '14px', right: '48px', zIndex: 10,
+            padding: '9px 20px', background: COR_BOTAO, color: '#fff',
+            border: 'none', borderRadius: '6px', fontSize: '12px', fontWeight: '700',
+            cursor: 'pointer', boxShadow: '0 2px 6px rgba(0,0,0,.2)'
+        });
+        btn.addEventListener('click', tirarPrint);
+        return btn;
+    }
+
+    function atualizar() {
+        const naReserva = !!acharElementoPorTexto('Visualização da reserva');
+        let btn = document.getElementById(BTN_ID);
+        if (!naReserva) { btn?.remove(); return; }
+
+        const card = cardDe('Serviços dessa', ['Valores dessa', 'Passageiros dessa']);
+        if (!card) return;
+        if (btn && card.contains(btn)) return;
+
+        if (getComputedStyle(card).position === 'static') card.style.position = 'relative';
+        if (!btn) btn = criarBotao();
+        card.appendChild(btn);
+    }
+
+    return {
+        id: 'print_reserva',
+        name: 'SMART BUS - Print da Reserva',
+        defaultOn: true,
+        fixo: false,
+
+        init() {
+            if (!location.hostname.includes('smarttravelit.com')) return;
+
+            handleKeydown = (e) => {
+                if (e.altKey && e.key.toLowerCase() === 'p' && document.getElementById(BTN_ID)) {
+                    e.preventDefault();
+                    tirarPrint({ shiftKey: e.shiftKey });
+                }
+            };
+            document.addEventListener('keydown', handleKeydown);
+
+            observer = new MutationObserver((muts) => {
+                // ignora mudanças causadas pela composição temporária do print
+                if (muts.every(m => [...m.addedNodes, ...m.removedNodes].every(n => n.id === COMP_ID))) return;
+                clearTimeout(debounceId);
+                debounceId = setTimeout(atualizar, 400);
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+
+            atualizar();
+        },
+
+        destroy() {
+            observer?.disconnect();
+            observer = null;
+
+            clearTimeout(debounceId);
+            debounceId = null;
+
+            if (handleKeydown) document.removeEventListener('keydown', handleKeydown);
+            handleKeydown = null;
+
+            document.getElementById(BTN_ID)?.remove();
+            document.getElementById(COMP_ID)?.remove();
+        }
+    };
+}
+
+registrarModulo(criarModuloPrintReserva());
 
 //================================= FIM DOS MODULOS =======================================================================
 
@@ -4943,4 +5379,4 @@ registrarModulo(criarModuloRemoverAcentos());
     criarPainelMaster();
     aplicarEstadoInicial();
 
-})();console.log("Hello, World!");
+})();
