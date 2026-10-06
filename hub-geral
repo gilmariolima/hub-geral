@@ -4295,15 +4295,256 @@ function criarModuloSmartBusPreencherEmail() {
 }
 
 registrarModulo(criarModuloSmartBusPreencherEmail());
-
 // =========================================================================
-// MÓDULO 12 — Horário + Serviço
+// MÓDULO 12 — Horário + Serviço (+ Print de Poltronas)
+// Requer no cabeçalho do Painel (bloco ==UserScript==):
+// // @require https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js
 // =========================================================================
 function criarModuloHorarioServico() {
 
     let observer = null;
     let interval = null;
     let style = null;
+
+    const normalizar = t => (t || "").replace(/\s+/g, "").toUpperCase();
+
+    function criarSpan(texto, cor) {
+        const s = document.createElement("span");
+        s.textContent = texto;
+        if (cor) s.style.color = cor;
+        return s;
+    }
+
+    // Sobe a partir do título até o container que tem as poltronas
+    function acharMapa(titulo) {
+        for (let el = titulo.parentElement; el && el !== document.body; el = el.parentElement) {
+            const poltronas = [...el.querySelectorAll("*")].filter(
+                e => !e.children.length && /^\d{1,2}$/.test(e.textContent.trim())
+            );
+            if (poltronas.length >= 10) return el;
+        }
+        return null;
+    }
+
+    function feedback(btn, msg, erro = false) {
+        btn.textContent = msg;
+        btn.style.background = erro ? "#dc2626" : "#16a34a";
+        setTimeout(() => {
+            btn.textContent = "📷 Print poltronas";
+            btn.style.background = "#2563eb";
+            btn.disabled = false;
+        }, 1800);
+    }
+
+    function nomeArquivo(titulo, horario) {
+        const rota = ((titulo.innerText || "").split("\n")[0] || "")
+            .replace(/TRECHO\s*:/i, "")
+            .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+            .replace(/[^A-Za-z0-9]+/g, "-")
+            .replace(/^-|-$/g, "");
+        return `poltronas_${rota}_${horario.replace(":", "h")}.png`;
+    }
+
+    // Cor de fundo efetiva (sobe até 3 níveis se for transparente)
+    function fundo(win, el) {
+        for (let i = 0; el && i < 4; i++, el = el.parentElement) {
+            const m = win.getComputedStyle(el).backgroundColor.match(/\d+/g);
+            if (m && !(m.length === 4 && +m[3] === 0)) return m.map(Number);
+        }
+        return null;
+    }
+
+    function prepararClone(doc) {
+        const win = doc.defaultView;
+
+        // percorre só o mapa clonado, não a página inteira
+        const raiz = doc.querySelector("[data-tm-mapa]") || doc.body;
+
+        raiz.querySelectorAll("*").forEach(el => {
+
+            // Botão de print some
+            if (el.classList.contains("tm-print-btn")) {
+                el.style.visibility = "hidden";
+                return;
+            }
+
+            // Compara só o texto PRÓPRIO do elemento (ícones e conteúdo
+            // escondido dentro dele atrapalhavam a comparação antiga)
+            const proprio = normalizar(
+                [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.nodeValue).join("") ||
+                el.value || ""
+            );
+
+            // "SEM ASSENTO" + botão "+": esconde o grupo inteiro
+            if (proprio === "SEMASSENTO") {
+                let alvo = el.closest("button, a, [role=button]") || el;
+                while (
+                    alvo.parentElement &&
+                    normalizar(alvo.parentElement.textContent).startsWith("SEMASSENTO") &&
+                    normalizar(alvo.parentElement.textContent).length < 25
+                ) {
+                    alvo = alvo.parentElement;
+                }
+                alvo.style.visibility = "hidden";
+                return;
+            }
+
+            // "Exibir legenda" / "Ocultar legenda"
+            if (proprio === "EXIBIRLEGENDA" || proprio === "OCULTARLEGENDA") {
+                (el.closest("button, a, [role=button]") || el).style.visibility = "hidden";
+                return;
+            }
+
+            // Poltronas vermelhas (ocupadas) sem número
+            if (!el.children.length && /^\d{1,2}$/.test(el.textContent.trim())) {
+                const c = fundo(win, el);
+                if (c && c[0] > 180 && c[1] < 130 && c[2] < 130) {
+                    el.style.color = "transparent";
+                    el.style.textShadow = "none";
+                }
+            }
+        });
+    }
+
+    // Carrega o html2canvas sob demanda se o @require não estiver disponível
+    const URL_H2C = "https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js";
+    let promessaH2c = null;
+
+    function pegarHtml2canvas() {
+        if (typeof html2canvas !== "undefined") return html2canvas;
+        if (window.html2canvas) return window.html2canvas;
+        if (typeof unsafeWindow !== "undefined" && unsafeWindow.html2canvas) return unsafeWindow.html2canvas;
+        return null;
+    }
+
+    function carregarHtml2canvas() {
+        const pronto = pegarHtml2canvas();
+        if (pronto) return Promise.resolve(pronto);
+
+        if (!promessaH2c) {
+            promessaH2c = new Promise((resolve, reject) => {
+                const pagina = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+
+                // Se o site usar AMD (define.amd), o html2canvas não cria a global:
+                // desativa o define só durante o carregamento
+                const defineOriginal = pagina.define;
+                if (defineOriginal?.amd) pagina.define = undefined;
+                const restaurar = () => { if (defineOriginal?.amd) pagina.define = defineOriginal; };
+
+                const s = document.createElement("script");
+                s.src = URL_H2C;
+                s.onload = () => {
+                    restaurar();
+                    const f = pegarHtml2canvas();
+                    f ? resolve(f) : reject(new Error("h2c"));
+                };
+                s.onerror = () => { restaurar(); reject(new Error("h2c")); };
+                document.head.appendChild(s);
+            }).catch(e => {
+                promessaH2c = null; // permite tentar de novo no próximo clique
+                throw e;
+            });
+        }
+        return promessaH2c;
+    }
+
+    // Largura do print: do início do card até um pouco depois do ônibus
+    function larguraAteOnibus(mapa) {
+        const rMapa = mapa.getBoundingClientRect();
+        const poltronas = [...mapa.querySelectorAll("*")].filter(
+            e => !e.children.length && /^\d{1,2}$/.test(e.textContent.trim())
+        );
+        if (!poltronas.length) return Math.ceil(rMapa.width);
+
+        // borda direita da última poltrona + espaço da lataria do ônibus
+        let direita = Math.max(...poltronas.map(p => p.getBoundingClientRect().right)) + 40;
+
+        // se existir um container só do ônibus (menor que o card), usa a borda dele
+        let onibus = poltronas[0];
+        while (onibus && !poltronas.every(p => onibus.contains(p))) onibus = onibus.parentElement;
+        if (onibus && onibus !== mapa) {
+            const rOnibus = onibus.getBoundingClientRect().right;
+            if (rOnibus < rMapa.right - 50) direita = Math.max(direita, rOnibus);
+        }
+
+        const MARGEM = 20; // "um pouco depois"
+        return Math.min(Math.ceil(rMapa.width), Math.ceil(direita - rMapa.left + MARGEM));
+    }
+
+    async function tirarPrint(btn, titulo, horario) {
+
+        const mapa = acharMapa(titulo);
+        if (!mapa) return feedback(btn, "Mapa não encontrado", true);
+
+        btn.disabled = true;
+        btn.textContent = "Gerando...";
+
+        const largura = larguraAteOnibus(mapa);
+        mapa.setAttribute("data-tm-mapa", "1");
+
+        const gerarBlob = carregarHtml2canvas().then(h2c => h2c(mapa, {
+            backgroundColor: "#ffffff",
+            width: largura, // corta logo depois do lado direito do ônibus
+            imageTimeout: 1500, // padrão é 15s esperando imagem que não carrega
+            // não clona/carrega o que está fora do mapa (outras viagens, imagens da página)
+            ignoreElements: el =>
+                !mapa.contains(el) && !el.contains(mapa) &&
+                (el.tagName === "APP-SERVICEROW" ||
+                 /^(IMG|IFRAME|VIDEO|CANVAS|OBJECT|EMBED)$/.test(el.tagName)),
+            scale: 2,
+            useCORS: true,
+            logging: false,
+            // Mexe só na cópia usada pelo print, a tela real não muda
+            onclone: doc => prepararClone(doc)
+        })).then(c => new Promise(res => c.toBlob(res, "image/png")))
+           .finally(() => mapa.removeAttribute("data-tm-mapa"));
+
+        try {
+            // Promise direto no ClipboardItem: funciona no Chrome e no Safari
+            await navigator.clipboard.write([new ClipboardItem({ "image/png": gerarBlob })]);
+            feedback(btn, "✓ Copiado!");
+        } catch (e) {
+            let blob = null;
+            try {
+                blob = await gerarBlob;
+            } catch (erro) {
+                console.error("[Print poltronas]", erro);
+                return feedback(btn, erro?.message === "h2c" ? "html2canvas não carregou" : "Erro no print", true);
+            }
+            if (!blob) return feedback(btn, "Erro no print", true);
+            const a = document.createElement("a");
+            a.href = URL.createObjectURL(blob);
+            a.download = nomeArquivo(titulo, horario);
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+            feedback(btn, "✓ Baixado");
+        }
+    }
+
+    function criarBotao(titulo, horario) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "tm-print-btn";
+        b.textContent ="Print poltronas";
+        b.setAttribute("data-html2canvas-ignore", "true");
+        Object.assign(b.style, {
+            marginLeft: "300px",
+            padding: "8px 12px",
+            border: "none",
+            borderRadius: "4px",
+            background: "darkred",
+            color: "#fff",
+            fontSize: "11px",
+            fontWeight: "700",
+            cursor: "pointer"
+        });
+        b.addEventListener("click", e => {
+            e.preventDefault();
+            e.stopPropagation();
+            tirarPrint(b, titulo, horario);
+        });
+        return b;
+    }
 
     function atualizar() {
 
@@ -4320,13 +4561,15 @@ function criarModuloHorarioServico() {
                 .trim();
 
             const primeiroHorario = (textoOriginal.match(/\d{2}:\d{2}/) || [""])[0];
+            const nomeServico = servico.textContent.trim();
+            const chave = `${primeiroHorario}|${nomeServico}`;
 
-            const texto = ` | ${primeiroHorario} | ${servico.textContent.trim()}`;
-
+            // wrap permite a info ir para a linha de baixo
             titulo.style.display = "flex";
             titulo.style.alignItems = "center";
-            titulo.style.flexWrap = "nowrap";
+            titulo.style.flexWrap = "wrap";
 
+            // span (não div) por causa do CSS ".seat-map-route h4 > div { display:none }"
             let info = titulo.querySelector(".tm-info");
 
             if (!info) {
@@ -4334,18 +4577,38 @@ function criarModuloHorarioServico() {
                 info = document.createElement("span");
                 info.className = "tm-info";
 
-                info.style.marginLeft = "10px";
-                info.style.whiteSpace = "nowrap";
-                info.style.fontWeight = "700";
-                info.style.fontSize = "inherit";
-                info.style.color = "inherit";
+                Object.assign(info.style, {
+                    flexBasis: "100%",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    marginTop: "4px",
+                    whiteSpace: "nowrap",
+                    fontWeight: "700",
+                    fontSize: "inherit",
+                    color: "inherit"
+                });
 
                 titulo.appendChild(info);
             }
 
-            if (info.textContent !== texto) {
-                info.textContent = texto;
-            }
+            if (info.dataset.chave === chave) return;
+            info.dataset.chave = chave;
+
+            // cor do label "TRECHO:" para os labels novos
+            const lbl = [...titulo.children].find(
+                c => c !== info && /TRECHO/i.test(c.textContent)
+            ) || titulo;
+            const corLabel = getComputedStyle(lbl).color;
+
+            info.textContent = "";
+            info.append(
+                criarSpan("HORÁRIO:", corLabel),
+                criarSpan(primeiroHorario),
+                criarSpan("|", corLabel),
+                criarSpan(nomeServico),
+                criarBotao(titulo, primeiroHorario)
+            );
 
         });
 
@@ -4383,6 +4646,9 @@ function criarModuloHorarioServico() {
             });
 
             interval = setInterval(atualizar, 1000);
+
+            // deixa o html2canvas pronto antes do primeiro clique
+            setTimeout(() => carregarHtml2canvas().catch(() => {}), 1500);
 
         },
 
