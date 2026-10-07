@@ -4295,7 +4295,7 @@ function criarModuloSmartBusPreencherEmail() {
 }
 
 registrarModulo(criarModuloSmartBusPreencherEmail());
-// =========================================================================
+    // =========================================================================
 // MÓDULO 12 — Horário + Serviço (+ Print de Poltronas)
 // Requer no cabeçalho do Painel (bloco ==UserScript==):
 // // @require https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js
@@ -4306,6 +4306,9 @@ function criarModuloHorarioServico() {
     let interval = null;
     let style = null;
 
+    const TEXTO_BOTAO = "Print poltronas";
+    const COR_BOTAO = "darkred";
+
     const normalizar = t => (t || "").replace(/\s+/g, "").toUpperCase();
 
     function criarSpan(texto, cor) {
@@ -4315,23 +4318,27 @@ function criarModuloHorarioServico() {
         return s;
     }
 
-    // Sobe a partir do título até o container que tem as poltronas
+    // Sobe a partir do título até o card do mapa, parando ANTES do bloco
+    // que também contém o card de TARIFAS (não depende de ter poltronas livres)
     function acharMapa(titulo) {
-        for (let el = titulo.parentElement; el && el !== document.body; el = el.parentElement) {
-            const poltronas = [...el.querySelectorAll("*")].filter(
-                e => !e.children.length && /^\d{1,2}$/.test(e.textContent.trim())
-            );
-            if (poltronas.length >= 10) return el;
+        const ehLimite = el =>
+            el === document.body ||
+            el.tagName === "APP-SERVICEROW" ||
+            /TARIFAS|SEGURO OPCIONAL|ESCOLHA UMA TARIFA/i.test(el.textContent || "");
+
+        let el = titulo.closest(".seat-map-route") || titulo;
+        while (el.parentElement && !ehLimite(el.parentElement)) {
+            el = el.parentElement;
         }
-        return null;
+        return el;
     }
 
     function feedback(btn, msg, erro = false) {
         btn.textContent = msg;
         btn.style.background = erro ? "#dc2626" : "#16a34a";
         setTimeout(() => {
-            btn.textContent = "📷 Print poltronas";
-            btn.style.background = "#2563eb";
+            btn.textContent = TEXTO_BOTAO;
+            btn.style.background = COR_BOTAO;
             btn.disabled = false;
         }, 1800);
     }
@@ -4368,8 +4375,7 @@ function criarModuloHorarioServico() {
                 return;
             }
 
-            // Compara só o texto PRÓPRIO do elemento (ícones e conteúdo
-            // escondido dentro dele atrapalhavam a comparação antiga)
+            // Compara só o texto PRÓPRIO do elemento
             const proprio = normalizar(
                 [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.nodeValue).join("") ||
                 el.value || ""
@@ -4448,20 +4454,26 @@ function criarModuloHorarioServico() {
         return promessaH2c;
     }
 
+    // Poltrona = quadradinho visível (com ou sem número)
+    function ehAssento(el) {
+        const r = el.getBoundingClientRect();
+        return r.width >= 20 && r.width <= 90 && Math.abs(r.width - r.height) <= 15;
+    }
+
     // Largura do print: do início do card até um pouco depois do ônibus
-    function larguraAteOnibus(mapa) {
+    function larguraAteOnibus(mapa, titulo) {
         const rMapa = mapa.getBoundingClientRect();
-        const poltronas = [...mapa.querySelectorAll("*")].filter(
-            e => !e.children.length && /^\d{1,2}$/.test(e.textContent.trim())
+        const assentos = [...mapa.querySelectorAll("*")].filter(
+            e => !titulo.contains(e) && ehAssento(e)
         );
-        if (!poltronas.length) return Math.ceil(rMapa.width);
+        if (!assentos.length) return Math.ceil(rMapa.width);
 
         // borda direita da última poltrona + espaço da lataria do ônibus
-        let direita = Math.max(...poltronas.map(p => p.getBoundingClientRect().right)) + 40;
+        let direita = Math.max(...assentos.map(p => p.getBoundingClientRect().right)) + 40;
 
         // se existir um container só do ônibus (menor que o card), usa a borda dele
-        let onibus = poltronas[0];
-        while (onibus && !poltronas.every(p => onibus.contains(p))) onibus = onibus.parentElement;
+        let onibus = assentos[0];
+        while (onibus && !assentos.every(p => onibus.contains(p))) onibus = onibus.parentElement;
         if (onibus && onibus !== mapa) {
             const rOnibus = onibus.getBoundingClientRect().right;
             if (rOnibus < rMapa.right - 50) direita = Math.max(direita, rOnibus);
@@ -4479,13 +4491,13 @@ function criarModuloHorarioServico() {
         btn.disabled = true;
         btn.textContent = "Gerando...";
 
-        const largura = larguraAteOnibus(mapa);
+        const largura = larguraAteOnibus(mapa, titulo);
         mapa.setAttribute("data-tm-mapa", "1");
 
         const gerarBlob = carregarHtml2canvas().then(h2c => h2c(mapa, {
             backgroundColor: "#ffffff",
             width: largura, // corta logo depois do lado direito do ônibus
-            imageTimeout: 1500, // padrão é 15s esperando imagem que não carrega
+            imageTimeout: 1500,
             // não clona/carrega o que está fora do mapa (outras viagens, imagens da página)
             ignoreElements: el =>
                 !mapa.contains(el) && !el.contains(mapa) &&
@@ -4525,14 +4537,14 @@ function criarModuloHorarioServico() {
         const b = document.createElement("button");
         b.type = "button";
         b.className = "tm-print-btn";
-        b.textContent ="Print poltronas";
+        b.textContent = TEXTO_BOTAO;
         b.setAttribute("data-html2canvas-ignore", "true");
         Object.assign(b.style, {
             marginLeft: "300px",
             padding: "8px 12px",
             border: "none",
             borderRadius: "4px",
-            background: "darkred",
+            background: COR_BOTAO,
             color: "#fff",
             fontSize: "11px",
             fontWeight: "700",
@@ -4675,7 +4687,6 @@ function criarModuloHorarioServico() {
 }
 
 registrarModulo(criarModuloHorarioServico());
-
 // =========================================================================
 // MÓDULO 13 — Copiar Link (modal de compartilhamento)
 // =========================================================================
