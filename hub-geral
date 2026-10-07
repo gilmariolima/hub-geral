@@ -4295,6 +4295,7 @@ function criarModuloSmartBusPreencherEmail() {
 }
 
 registrarModulo(criarModuloSmartBusPreencherEmail());
+
     // =========================================================================
 // MÓDULO 12 — Horário + Serviço (+ Print de Poltronas)
 // Requer no cabeçalho do Painel (bloco ==UserScript==):
@@ -4454,33 +4455,70 @@ function criarModuloHorarioServico() {
         return promessaH2c;
     }
 
+    // Elementos que não entram na conta da largura (botão de print, "SEM ASSENTO", legenda)
+    function ignorarNaLargura(el) {
+        if (el.closest(".tm-print-btn")) return true;
+        const grupo = el.closest("button, a, [role=button]") || el;
+        return /SEM\s*ASSENTO|LEGENDA/i.test(grupo.textContent || "");
+    }
+
     // Poltrona = quadradinho visível (com ou sem número)
     function ehAssento(el) {
         const r = el.getBoundingClientRect();
         return r.width >= 20 && r.width <= 90 && Math.abs(r.width - r.height) <= 15;
     }
 
-    // Largura do print: do início do card até um pouco depois do ônibus
-    function larguraAteOnibus(mapa, titulo) {
+    // Recorte do print: largura até a traseira do ônibus e altura até a parte
+    // de baixo do ônibus, sem nunca cortar o texto do TRECHO / HORÁRIO
+    function medirRecorte(mapa, titulo) {
         const rMapa = mapa.getBoundingClientRect();
-        const assentos = [...mapa.querySelectorAll("*")].filter(
-            e => !titulo.contains(e) && ehAssento(e)
-        );
-        if (!assentos.length) return Math.ceil(rMapa.width);
+        const inteiro = { largura: Math.ceil(rMapa.width), altura: Math.ceil(rMapa.height) };
+        const limite = rMapa.width * 0.95; // ignora wrappers que ocupam o card inteiro
+        let direita = 0;
+        let base = 0;
 
-        // borda direita da última poltrona + espaço da lataria do ônibus
-        let direita = Math.max(...assentos.map(p => p.getBoundingClientRect().right)) + 40;
-
-        // se existir um container só do ônibus (menor que o card), usa a borda dele
-        let onibus = assentos[0];
-        while (onibus && !assentos.every(p => onibus.contains(p))) onibus = onibus.parentElement;
-        if (onibus && onibus !== mapa) {
-            const rOnibus = onibus.getBoundingClientRect().right;
-            if (rOnibus < rMapa.right - 50) direita = Math.max(direita, rOnibus);
+        // 1) Fim do texto do título (TRECHO e HORÁRIO), medido pelo texto real
+        const walker = document.createTreeWalker(titulo, NodeFilter.SHOW_TEXT);
+        const range = document.createRange();
+        let n;
+        while ((n = walker.nextNode())) {
+            if (!n.nodeValue.trim() || ignorarNaLargura(n.parentElement)) continue;
+            range.selectNodeContents(n);
+            const r = range.getBoundingClientRect();
+            if (r.width > 0) {
+                direita = Math.max(direita, r.right);
+                base = Math.max(base, r.bottom);
+            }
         }
 
-        const MARGEM = 20; // "um pouco depois"
-        return Math.min(Math.ceil(rMapa.width), Math.ceil(direita - rMapa.left + MARGEM));
+        // 2) Faixa vertical do ônibus, a partir das poltronas
+        const pecas = [...mapa.querySelectorAll("*")].filter(
+            el => !titulo.contains(el) && !ignorarNaLargura(el)
+        );
+        const assentos = pecas.filter(ehAssento);
+        if (!assentos.length) return inteiro;
+
+        const rects = assentos.map(a => a.getBoundingClientRect());
+        const faixaTopo = Math.min(...rects.map(r => r.top));
+        const faixaBase = Math.max(...rects.map(r => r.bottom));
+
+        // 3) Peças do desenho na altura do ônibus (lataria, traseira, poltronas).
+        //    O que está só acima ou só abaixo ("Exibir legenda", "Somente mais X
+        //    poltronas", "BJS → JDO") fica de fora.
+        pecas.forEach(el => {
+            const r = el.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0 || r.width >= limite) return;
+            if (r.bottom <= faixaTopo || r.top >= faixaBase) return;
+            direita = Math.max(direita, r.right);
+            base = Math.max(base, r.bottom);
+        });
+
+        const MARGEM_LADO = 10;  // respiro depois da traseira
+        const MARGEM_BAIXO = 20; // respiro abaixo do ônibus
+        return {
+            largura: Math.min(inteiro.largura, Math.ceil(direita - rMapa.left + MARGEM_LADO)),
+            altura: Math.min(inteiro.altura, Math.ceil(base - rMapa.top + MARGEM_BAIXO))
+        };
     }
 
     async function tirarPrint(btn, titulo, horario) {
@@ -4491,12 +4529,13 @@ function criarModuloHorarioServico() {
         btn.disabled = true;
         btn.textContent = "Gerando...";
 
-        const largura = larguraAteOnibus(mapa, titulo);
+        const { largura, altura } = medirRecorte(mapa, titulo);
         mapa.setAttribute("data-tm-mapa", "1");
 
         const gerarBlob = carregarHtml2canvas().then(h2c => h2c(mapa, {
             backgroundColor: "#ffffff",
-            width: largura, // corta logo depois do lado direito do ônibus
+            width: largura,  // corta logo depois da traseira do ônibus
+            height: altura,  // corta logo abaixo do ônibus
             imageTimeout: 1500,
             // não clona/carrega o que está fora do mapa (outras viagens, imagens da página)
             ignoreElements: el =>
