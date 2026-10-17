@@ -5339,11 +5339,12 @@ function criarModuloPrintReserva() {
 }
 
 registrarModulo(criarModuloPrintReserva());
+
 // =========================================================================
     // MÓDULO — SMART BUS: Copiar e Refazer Reserva
     // =========================================================================
     // Tela da reserva: botão "Copiar reserva" lê trechos, poltronas e passageiros
-    // e copia um JSON. Tela "Nova pesquisa para reserva" (normal ou fiscal): colar
+    // e copia um JSON. Telas "Nova pesquisa para reserva/venda" (normal ou fiscal): colar
     // esse JSON na caixa ao lado de PESQUISAR refaz a reserva sozinho (pesquisa,
     // viagem, tarifa NORMAL mais barata, poltronas e dados dos passageiros) e para
     // antes de finalizar, para conferência.
@@ -5651,9 +5652,9 @@ registrarModulo(criarModuloPrintReserva());
             try { return JSON.parse(colado); } catch { toast('JSON inválido.', true); return null; }
         }
 
+        // Usa o mesmo critério da caixa (aceita o selo "fiscal" num elemento separado)
         function telaDePesquisa() {
-            return Array.from(document.querySelectorAll('h1, h2, h3, h4, h5, .card-title, div, span'))
-                .some((el) => el.children.length === 0 && /Nova pesquisa para reserva/i.test(el.textContent) && visivel(el));
+            return titulosPesquisa().length > 0;
         }
 
         // Clique como o de uma pessoa: no elemento que está de fato no ponto clicado
@@ -5764,9 +5765,10 @@ registrarModulo(criarModuloPrintReserva());
             return !!m && +m[0] > 180 && +m[1] < 110 && +m[2] < 110;
         }
 
-        async function escolherViagemEPoltronas(t, qtd, nome) {
+        // abrir: clica no card da viagem | tarifa: clica na tarifa antes de cada poltrona
+        async function escolherViagemEPoltronas(t, qtd, nome, { abrir = true, tarifa: comTarifa = true } = {}) {
             // 1) Viagem (se a tabela de tarifas já estiver aberta, a viagem já foi escolhida)
-            if (!listaTarifas()) {
+            if (abrir && !listaTarifas()) {
                 const card = acharViagem(t);
                 toast(`${nome}: abrindo serviço ${t.servico} das ${t.horario}…`);
                 // Tenta alguns pontos do card (centro, número do serviço, preço) até a tarifa abrir
@@ -5794,6 +5796,7 @@ registrarModulo(criarModuloPrintReserva());
 
             // 2) Para cada poltrona: clica na tarifa NORMAL mais em conta e depois na poltrona
             for (const num of t.poltronas) {
+              if (comTarifa) {
                 let ultimoErro = null;
                 const tarifa = await esperar(() => {
                     try { return listaTarifas() && tarifaMaisBarata(listaTarifas(), qtd); }
@@ -5804,6 +5807,9 @@ registrarModulo(criarModuloPrintReserva());
                 toast(`${nome}: tarifa NORMAL BRL ${tarifa.valor.toFixed(2).replace('.', ',')} → poltrona ${num}…`);
                 cliqueReal(tarifa.el);
                 await sleep(500);
+              } else {
+                toast(`${nome}: poltrona ${num}…`);
+              }
 
                 const p = await esperar(() => acharPoltrona(num), 8000);
                 if (!p) throw new Error(`${nome}: poltrona ${num} não encontrada no mapa.`);
@@ -5814,6 +5820,45 @@ registrarModulo(criarModuloPrintReserva());
                 cliqueReal(p);
                 await sleep(700);
             }
+        }
+
+        // ───────────────────────── Conexão ─────────────────────────
+        // Conexão: o 2º trecho sai de onde o 1º chega e termina em OUTRA cidade
+        // (ida e volta termina na origem do 1º). Ex.: BH → Goiânia + Goiânia → Canto do Buriti.
+        const cidadeUF = (t) => semAcento(t).replace(/\s*-\s*/g, '-');
+        function ehConexao(r) {
+            return !!(r.volta && cidadeUF(r.volta.origem) === cidadeUF(r.ida.destino) &&
+                cidadeUF(r.volta.destino) !== cidadeUF(r.ida.origem));
+        }
+
+        // Cabeçalho do mapa: "TRECHO: BELO HORIZONTE - MG → GOIANIA - GO"
+        function trechoDoMapa() {
+            const el = Array.from(document.querySelectorAll('span, div, label, strong, b'))
+                .find((e) => visivel(e) && /^TRECHO:?$/.test(textoProprio(e)));
+            return el ? semAcento(el.parentElement.textContent) : '';
+        }
+
+        // Botões embaixo do mapa (div.seat-map-route-card: "BHZ → GYN", "GYN → CBT")
+        async function irParaMapaDoTrecho(indice, t) {
+            const cards = Array.from(document.querySelectorAll('.seat-map-route-card')).filter(visivel);
+            if (!cards[indice]) throw new Error(`Botão do ${indice + 1}º trecho da conexão não encontrado embaixo do mapa.`);
+            const cidade = partesCidade(t.origem).cidade;
+            const antes = trechoDoMapa();
+            const mapaAntes = Array.from(document.querySelectorAll('.bus-border')).find(visivel);
+            const poltronasAntes = mapaAntes ? Array.from(mapaAntes.querySelectorAll('.vehicle-item')) : [];
+            toast(`Conexão: abrindo o mapa ${norm(cards[indice].textContent)}…`);
+            cliqueReal(cards[indice]);
+            // Segue assim que o mapa trocar: cabeçalho novo, outro mapa visível ou
+            // poltronas antigas fora da tela/substituídas (o que acontecer primeiro)
+            await esperar(() => {
+                const agora = trechoDoMapa();
+                if (agora && agora !== antes && agora.includes(cidade)) return true;
+                const mapa = Array.from(document.querySelectorAll('.bus-border')).find(visivel);
+                if (mapa && mapa !== mapaAntes) return true;
+                if (poltronasAntes.length && poltronasAntes.every((el) => !el.isConnected || !visivel(el))) return true;
+                return false;
+            }, 3000, 100);
+            await sleep(300);
         }
 
         async function irParaVolta() {
@@ -6023,13 +6068,15 @@ registrarModulo(criarModuloPrintReserva());
             const naPesquisa = telaDePesquisa();
             const temPassageiros = blocosPassageiro().length > 0;
             if (!naPesquisa && !cardsViagem().length && !temPassageiros) {
-                toast('Abra a tela "Nova pesquisa para reserva".', true);
+                toast('Abra a tela "Nova pesquisa para reserva" ou "para venda".', true);
                 return;
             }
             const r = dados || lerReservaSalva();
             if (!r) return;
             const { ida, volta } = r;
             const qtd = Math.max(1, r.passageiros?.length || ida.poltronas.length);
+            const conexao = ehConexao(r);
+            if (conexao) log('Conexão:', ida.origem, '→', ida.destino, '→', volta.destino);
 
             rodando = true;
             try {
@@ -6037,6 +6084,17 @@ registrarModulo(criarModuloPrintReserva());
                 const soPassageiros = poltronasFeitas || (temPassageiros && !cardsViagem().length);
 
                 if (!soPassageiros) {
+                    if (conexao) {
+                        // Conexão: pesquisa só de ida, da origem do 1º trecho ao destino do 2º
+                        if (naPesquisa && !cardsViagem().length) {
+                            await pesquisar({ ...ida, destino: volta.destino }, null);
+                        }
+                        // Card da viagem pelo serviço/horário do 1º trecho
+                        await escolherViagemEPoltronas(ida, qtd, '1º trecho');
+                        // Botão do 2º trecho embaixo do mapa e as poltronas dele
+                        await irParaMapaDoTrecho(1, volta);
+                        await escolherViagemEPoltronas(volta, qtd, '2º trecho', { abrir: false, tarifa: false });
+                    } else {
                     if (naPesquisa && !cardsViagem().length) {
                         trechoAtual = 'ida';
                         await pesquisar(ida, volta);
@@ -6051,6 +6109,7 @@ registrarModulo(criarModuloPrintReserva());
                     }
                     if (trechoAtual === 'volta' && volta) {
                         await escolherViagemEPoltronas(volta, qtd, 'Volta');
+                    }
                     }
                     poltronasFeitas = true;
                 }
@@ -6143,7 +6202,8 @@ registrarModulo(criarModuloPrintReserva());
                 return;
             }
             caixa.style.borderColor = '#16a34a';
-            caixa.value = `${r.ida.origem} → ${r.ida.destino} · ${r.ida.data}` + (r.volta ? ` (volta ${r.volta.data})` : '') +
+            caixa.value = `${r.ida.origem} → ${r.ida.destino} · ${r.ida.data}` +
+                (r.volta ? (ehConexao(r) ? ` → ${r.volta.destino} (conexão)` : ` (volta ${r.volta.data})`) : '') +
                 ` · ${(r.passageiros || []).length} passageiro(s)`;
             GM_setValue(STORAGE_KEY, r);
             // Reserva nova: começa do zero
@@ -6152,13 +6212,14 @@ registrarModulo(criarModuloPrintReserva());
             fazerReserva(r);
         }
 
-        // Títulos "Nova pesquisa para reserva" e "Nova pesquisa para reserva fiscal" visíveis
+        // Títulos "Nova pesquisa para reserva" / "para venda", com ou sem "fiscal"
+        // (o selo "fiscal" pode vir junto no texto ou num elemento separado)
         function titulosPesquisa() {
             const achados = [];
             const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
             while (w.nextNode()) {
                 const n = w.currentNode;
-                if (/^\s*Nova pesquisa para reserva(\s+fiscal)?\s*$/i.test(n.nodeValue) && visivel(n.parentElement)) {
+                if (/^\s*Nova pesquisa para (reserva|venda)(\s+fiscal)?\s*$/i.test(n.nodeValue) && visivel(n.parentElement)) {
                     achados.push(n.parentElement);
                 }
             }
@@ -6303,6 +6364,9 @@ registrarModulo(criarModuloPrintReserva());
     } catch (erro) {
         console.error('[Painel de Scripts] Erro ao criar "Copiar e Refazer Reserva":', erro);
     }
+
+
+
 
 //================================= FIM DOS MODULOS =======================================================================
 
