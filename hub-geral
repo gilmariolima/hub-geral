@@ -3485,6 +3485,7 @@ function registrarModulo(mod) {
 
     registrarModulo(criarModuloPreencherPassageiros());
 
+
     // =========================================================================
     // MÓDULO 8 — Botões de Mensagens Rápidas (Tallos)
     // =========================================================================
@@ -3783,6 +3784,7 @@ Para darmos continuidade, estarei gerando uma nova reserva para o(a) senhor(a). 
     }
 
     registrarModulo(criarModuloTallosBotoesMensagens());
+
 
     // =========================================================================
     // MÓDULO 9 — Copiar com um Clique (SmartBus/Guanabara)
@@ -5340,14 +5342,15 @@ function criarModuloPrintReserva() {
 
 registrarModulo(criarModuloPrintReserva());
 
+
 // =========================================================================
     // MÓDULO — SMART BUS: Copiar e Refazer Reserva
     // =========================================================================
-    // Tela da reserva: botão "Copiar reserva" lê trechos, poltronas e passageiros
-    // e copia um JSON. Telas "Nova pesquisa para reserva/venda" (normal ou fiscal): colar
-    // esse JSON na caixa ao lado de PESQUISAR refaz a reserva sozinho (pesquisa,
-    // viagem, tarifa NORMAL mais barata, poltronas e dados dos passageiros) e para
-    // antes de finalizar, para conferência.
+    // Tela da reserva: botão "Copiar reserva" (dentro do .card-coupon-area) lê trechos,
+    // poltronas e passageiros e copia um JSON. Telas "Nova pesquisa para reserva/venda"
+    // (normal ou fiscal): colar esse JSON na caixa ao lado de PESQUISAR refaz a reserva
+    // sozinho (pesquisa, viagem, tarifa NORMAL mais barata, poltronas e dados dos
+    // passageiros) e para antes de finalizar, para conferência.
     function criarModuloReservaAutomatica() {
         const STORAGE_KEY = 'reserva_pendente';
         const NASCIMENTO_PADRAO = '01/10/2026'; // usada para todos os passageiros
@@ -5525,7 +5528,7 @@ registrarModulo(criarModuloPrintReserva());
         // ───────────────────────── Preenchimento: Nova pesquisa para reserva ─────────────────────────
         const pageWin = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
         const sleep = (ms) => new Promise((ok) => setTimeout(ok, ms));
-        const semAcento = (t) => norm(t).normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase();
+        const semAcento = (t) => norm(t).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase();
         // Visível na tela (funciona também dentro de modal com position: fixed)
         const visivel = (el) => !!(el && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden');
         const log = (...a) => console.log('[Reserva automática]', ...a);
@@ -6095,21 +6098,21 @@ registrarModulo(criarModuloPrintReserva());
                         await irParaMapaDoTrecho(1, volta);
                         await escolherViagemEPoltronas(volta, qtd, '2º trecho', { abrir: false, tarifa: false });
                     } else {
-                    if (naPesquisa && !cardsViagem().length) {
-                        trechoAtual = 'ida';
-                        await pesquisar(ida, volta);
-                    }
-                    if (trechoAtual === 'ida') {
-                        await escolherViagemEPoltronas(ida, qtd, 'Ida');
-                        if (volta) {
-                            toast('Ida pronta. Indo para a volta…');
-                            await irParaVolta();
-                            trechoAtual = 'volta';
+                        if (naPesquisa && !cardsViagem().length) {
+                            trechoAtual = 'ida';
+                            await pesquisar(ida, volta);
                         }
-                    }
-                    if (trechoAtual === 'volta' && volta) {
-                        await escolherViagemEPoltronas(volta, qtd, 'Volta');
-                    }
+                        if (trechoAtual === 'ida') {
+                            await escolherViagemEPoltronas(ida, qtd, 'Ida');
+                            if (volta) {
+                                toast('Ida pronta. Indo para a volta…');
+                                await irParaVolta();
+                                trechoAtual = 'volta';
+                            }
+                        }
+                        if (trechoAtual === 'volta' && volta) {
+                            await escolherViagemEPoltronas(volta, qtd, 'Volta');
+                        }
                     }
                     poltronasFeitas = true;
                 }
@@ -6125,7 +6128,8 @@ registrarModulo(criarModuloPrintReserva());
             }
         }
 
-        // ───────────────────────── Botão ─────────────────────────
+        // ───────────────────────── Avisos (toast) ─────────────────────────
+        // O Shadow DOM agora guarda só o aviso. O botão "Copiar reserva" fica dentro do card.
         const host = document.createElement('div');
         host.id = 'ps-reserva-captura-painel';
         const root = host.attachShadow({ mode: 'open' });
@@ -6133,13 +6137,6 @@ registrarModulo(criarModuloPrintReserva());
         <style>
             :host { all: initial; }
             * { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-            .fab {
-                position: fixed; right: 20px; bottom: 90px; z-index: 2147483000;
-                background: #2563eb; color: #fff; border: 0; border-radius: 999px;
-                padding: 10px 16px; font-size: 14px; font-weight: 600; cursor: pointer;
-                box-shadow: 0 4px 14px rgba(37,99,235,.35);
-            }
-            .fab:hover { background: #1d4ed8; }
             .toast {
                 position: fixed; right: 20px; bottom: 140px; z-index: 2147483001; max-width: 340px;
                 background: #0f172a; color: #fff; padding: 10px 14px; border-radius: 8px; font-size: 13px; line-height: 1.4; white-space: pre-line;
@@ -6148,7 +6145,6 @@ registrarModulo(criarModuloPrintReserva());
             .toast.show { opacity: 1; }
             .toast.warn { background: #92400e; }
         </style>
-        <button class="fab" id="fab" title="Copiar dados da reserva">🎫 Copiar reserva</button>
         <div class="toast" id="toast"></div>
         `;
 
@@ -6161,7 +6157,11 @@ registrarModulo(criarModuloPrintReserva());
             toast._t = setTimeout(() => t.classList.remove('show'), warn ? 7000 : 3500);
         }
 
-        root.getElementById('fab').addEventListener('click', () => {
+        // ───────────────────────── Botão "Copiar reserva" (dentro do card) ─────────────────────────
+        const BTN_COPIAR_ID = 'ps-copiar-reserva-btn';
+
+        // Lê a tela e copia o JSON da reserva
+        function copiarReserva() {
             const r = capturarTela();
             if (!r.ida.origem && !r.ida.servico) {
                 toast('Nada encontrado. Abra a tela da reserva.', true);
@@ -6177,8 +6177,49 @@ registrarModulo(criarModuloPrintReserva());
                 `Copiado: ${r.ida.origem} → ${r.ida.destino}` + (r.volta ? " (ida e volta)" : "") + (f.length ? `\nNão encontrado: ${f.join(', ')}` : ''),
                 f.length > 0
             );
-        });
 
+            const btn = document.getElementById(BTN_COPIAR_ID);
+            if (btn) {
+                btn.textContent = '✓ Copiado!';
+                setTimeout(() => { btn.textContent = '🎫 Copiar reserva'; }, 1500);
+            }
+        }
+
+        // Coloca o botão no primeiro .card-coupon-area (mesmo card do "Copiar Trecho")
+        function colocarBotaoCopiar() {
+            const card = document.querySelector('.card-coupon-area');
+            if (!card) return;
+            if (card.querySelector('#' + BTN_COPIAR_ID)) return;
+
+            const btn = document.createElement('button');
+            btn.id = BTN_COPIAR_ID;
+            btn.type = 'button';
+            btn.textContent = '🎫 Copiar reserva';
+            btn.title = 'Copiar dados da reserva';
+            btn.style.cssText = `
+                margin-top: 35px;
+                margin-left: 8px;
+                padding: 10px 14px;
+                background: #2563eb;
+                color: #fff;
+                border: none;
+                border-radius: 8px;
+                cursor: pointer;
+                font-size: 13px;
+                font-weight: bold;
+                box-shadow: 0 6px 16px rgba(37, 99, 235, 0.35);
+                transition: background 0.15s ease;
+            `;
+            btn.addEventListener('mouseenter', () => { btn.style.background = '#1d4ed8'; });
+            btn.addEventListener('mouseleave', () => { btn.style.background = '#2563eb'; });
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                copiarReserva();
+            });
+
+            card.appendChild(btn);
+        }
 
         // ───────────────────────── Caixa "Colar reserva" na tela de pesquisa ─────────────────────────
         // Fica no espaço vazio ao lado do botão PESQUISAR. Ao colar o JSON copiado, a reserva começa.
@@ -6226,7 +6267,6 @@ registrarModulo(criarModuloPrintReserva());
             return achados;
         }
 
-        // Coloca uma caixa em cada tela de pesquisa aberta (normal e fiscal)
         // Mesmo lugar e mesmo visual da caixa do "Preencher Trecho":
         // dentro da 3ª ".col-button-only" da tela de pesquisa.
         function lugarDaCaixa(card) {
@@ -6237,6 +6277,7 @@ registrarModulo(criarModuloPrintReserva());
             return cols[cols.length - 1] || null;
         }
 
+        // Coloca uma caixa em cada tela de pesquisa aberta (normal e fiscal)
         function colocarCaixa() {
             for (const titulo of titulosPesquisa()) {
                 // Sobe do título até o card que tem o botão PESQUISAR
@@ -6341,19 +6382,24 @@ registrarModulo(criarModuloPrintReserva());
 
             init() {
                 if (!location.hostname.includes('smarttravelit.com')) return;
-                // Botão "Copiar reserva" (tela da reserva) + avisos
+                // Avisos (toast)
                 if (!host.isConnected) document.body.appendChild(host);
                 console.log('[Painel de Scripts] Copiar e Refazer Reserva: ligado');
-                // Caixa "Cole aqui a reserva copiada" nas telas de pesquisa.
-                // A tela é refeita pelo sistema ao navegar; recoloca a caixa quando precisar.
+                // Botão "Copiar reserva" no card da reserva + caixa "Cole aqui" nas telas de pesquisa.
+                // A tela é refeita pelo sistema ao navegar; recoloca os dois quando precisar.
                 colocarCaixa();
-                intervaloCaixa = setInterval(colocarCaixa, 1000);
+                colocarBotaoCopiar();
+                intervaloCaixa = setInterval(() => {
+                    colocarCaixa();
+                    colocarBotaoCopiar();
+                }, 1000);
             },
 
             destroy() {
                 clearInterval(intervaloCaixa);
                 intervaloCaixa = null;
                 host.remove();
+                document.getElementById(BTN_COPIAR_ID)?.remove();
                 document.querySelectorAll('.' + CAIXA_ID + '-area').forEach((c) => c.remove());
             }
         };
@@ -6364,8 +6410,6 @@ registrarModulo(criarModuloPrintReserva());
     } catch (erro) {
         console.error('[Painel de Scripts] Erro ao criar "Copiar e Refazer Reserva":', erro);
     }
-
-
 
 
 //================================= FIM DOS MODULOS =======================================================================
